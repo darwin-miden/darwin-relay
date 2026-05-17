@@ -48,7 +48,12 @@ miden-live = [
     "dep:miden-client",
     "dep:miden-client-sqlite-store",
     "dep:miden-protocol",
+    "dep:miden-tx",
 ]
+
+[dependencies.miden-tx]
+version  = "0.14"
+optional = true
 
 [[bin]]
 name = "darwin_relay_service"

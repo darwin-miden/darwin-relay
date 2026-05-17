@@ -21,7 +21,13 @@
 
 mod mock;
 
+#[cfg(feature = "miden-live")]
+mod live;
+
 pub use mock::MockMidenSubmitter;
+
+#[cfg(feature = "miden-live")]
+pub use live::{LiveMidenConfig, LiveMidenSubmitter};
 
 use async_trait::async_trait;
 
