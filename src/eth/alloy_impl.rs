@@ -170,7 +170,18 @@ where
             .send()
             .await
             .map_err(|e| EthError::Transient(format!("claim_deposit send: {e}")))?;
-        Ok(format_hash(pending.tx_hash().as_slice()))
+        let tx_hash = *pending.tx_hash();
+        // Wait for inclusion before returning so the next FSM step
+        // (which reads or transitions on-chain state) sees this tx's
+        // effect. Without this, fast back-to-back calls (claim →
+        // mintTo → confirm) race the on-chain status check inside
+        // `confirmDeposit` and revert with BadStatus.
+        let _ = pending
+            .with_required_confirmations(1)
+            .get_receipt()
+            .await
+            .map_err(|e| EthError::Transient(format!("claim_deposit await: {e}")))?;
+        Ok(format_hash(tx_hash.as_slice()))
     }
 
     async fn confirm_deposit(
@@ -184,7 +195,13 @@ where
             .send()
             .await
             .map_err(|e| EthError::Transient(format!("confirm_deposit send: {e}")))?;
-        Ok(format_hash(pending.tx_hash().as_slice()))
+        let tx_hash = *pending.tx_hash();
+        let _ = pending
+            .with_required_confirmations(1)
+            .get_receipt()
+            .await
+            .map_err(|e| EthError::Transient(format!("confirm_deposit await: {e}")))?;
+        Ok(format_hash(tx_hash.as_slice()))
     }
 
     async fn refund_deposit(&self, deposit_id: u64, reason: &str) -> Result<String, EthError> {
@@ -194,7 +211,13 @@ where
             .send()
             .await
             .map_err(|e| EthError::Transient(format!("refund_deposit send: {e}")))?;
-        Ok(format_hash(pending.tx_hash().as_slice()))
+        let tx_hash = *pending.tx_hash();
+        let _ = pending
+            .with_required_confirmations(1)
+            .get_receipt()
+            .await
+            .map_err(|e| EthError::Transient(format!("refund_deposit await: {e}")))?;
+        Ok(format_hash(tx_hash.as_slice()))
     }
 
     async fn mint_basket_to(
@@ -212,7 +235,13 @@ where
             .send()
             .await
             .map_err(|e| EthError::Transient(format!("mint_basket_to send: {e}")))?;
-        Ok(format_hash(pending.tx_hash().as_slice()))
+        let tx_hash = *pending.tx_hash();
+        let _ = pending
+            .with_required_confirmations(1)
+            .get_receipt()
+            .await
+            .map_err(|e| EthError::Transient(format!("mint_basket_to await: {e}")))?;
+        Ok(format_hash(tx_hash.as_slice()))
     }
 }
 

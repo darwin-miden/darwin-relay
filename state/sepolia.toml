@@ -106,3 +106,21 @@ claim_tx              = "0x63036da5f7565159c1364260cce5edbf2b5785d0951e913bed581
 erc20_mint_tx         = "0xb7addb0e718ac9275f8fffb123b10c77e2e2a14e079578af67189830b66ba44f"
 confirm_tx            = "0x5ffb99dd4127a8bc3bea036d4d162881344e160359e7cdf0b26e169edfa6baf3"
 final_status          = "settled"
+
+# Iter 5: AlloyEthClient now awaits 1 confirmation per call. Full
+# autonomous path with no retries / no manual rescue. Total wall
+# time ~65s for the deposit-to-settled cycle on Sepolia (publicnode
+# RPC); 16s claim + 35s mint + 15s confirm finality.
+[[live_runs]]
+label                 = "autonomous relay E2E into DAG basket — no race"
+basket_symbol         = "DAG"
+basket_id             = "0x74491929c2f72408e48b338222172a8a07d8c3087617d09881d00d72278eb6c1"
+basket_token          = "0x73F18087dd45d180e75cADcD383479624326E336"
+amount_usdc           = 200000000
+basket_minted         = 199400000
+deposit_tx            = "0x" # the user-side cast send tx; not captured here
+claim_tx              = "0xeb37fa1dc1ace22d5e012d052afc299488d0eec649fc91b225f636968ebc1533"
+erc20_mint_tx         = "0x7af144ba2813ad9f7bb5f0ba32a1994c3994ded70417e35727a450155b5a8cc3"
+confirm_tx            = "0x655a1d8583580d1b7ae9e4bb9ab9cbb51e1a1d8c61d401ce929bf0c8d5c72855"
+final_status          = "settled"
+notes                 = "iter5 receipt-await fix; 65s end-to-end; user got 199.4 DAG"
