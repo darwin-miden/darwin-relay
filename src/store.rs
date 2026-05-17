@@ -10,6 +10,7 @@
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::state::{DepositRecord, DepositStatus};
 
@@ -37,7 +38,7 @@ CREATE INDEX IF NOT EXISTS deposits_status_idx ON deposits(status);
 "#;
 
 pub struct DepositStore {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl DepositStore {
@@ -47,44 +48,65 @@ impl DepositStore {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
         conn.execute_batch(INIT_SQL)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(INIT_SQL)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn insert(&self, r: &DepositRecord) -> Result<()> {
-        self.conn
-            .execute(
-                r#"INSERT INTO deposits (
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"INSERT INTO deposits (
                     id, user_eth, basket_id, miden_recipient, amount_usdc,
                     status, requested_at_unix, last_event_unix
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
-                params![
-                    r.id as i64,
-                    r.user_eth,
-                    r.basket_id,
-                    r.miden_recipient,
-                    r.amount_usdc.to_string(),
-                    r.status.as_str(),
-                    r.requested_at_unix,
-                    r.last_event_unix,
-                ],
-            )
-            .with_context(|| format!("insert deposit {}", r.id))?;
+            params![
+                r.id as i64,
+                r.user_eth,
+                r.basket_id,
+                r.miden_recipient,
+                r.amount_usdc.to_string(),
+                r.status.as_str(),
+                r.requested_at_unix,
+                r.last_event_unix,
+            ],
+        )
+        .with_context(|| format!("insert deposit {}", r.id))?;
         Ok(())
     }
 
     pub fn update_status(&self, id: u64, status: DepositStatus, now_unix: i64) -> Result<()> {
-        let n = self.conn.execute(
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
             r#"UPDATE deposits SET status = ?1, last_event_unix = ?2 WHERE id = ?3"#,
             params![status.as_str(), now_unix, id as i64],
         )?;
         if n == 0 {
             return Err(anyhow!("update_status on unknown deposit {id}"));
+        }
+        Ok(())
+    }
+
+    /// Record the basket-amount the Miden submitter reported as
+    /// minted into the controller's private vault. The same number is
+    /// echoed by the ETH-side `mintTo` so the user's wDCC supply
+    /// tracks the Miden vault 1:1.
+    pub fn set_basket_amount_minted(&self, id: u64, amount: u128, now_unix: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            r#"UPDATE deposits SET basket_amount_minted = ?1, last_event_unix = ?2 WHERE id = ?3"#,
+            params![amount.to_string(), now_unix, id as i64],
+        )?;
+        if n == 0 {
+            return Err(anyhow!("set_basket_amount_minted on unknown deposit {id}"));
         }
         Ok(())
     }
@@ -99,9 +121,8 @@ impl DepositStore {
             TxColumn::Refund => "refund_tx",
         };
         let sql = format!("UPDATE deposits SET {col} = ?1, last_event_unix = ?2 WHERE id = ?3");
-        let n = self
-            .conn
-            .execute(&sql, params![tx_hash, now_unix, id as i64])?;
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(&sql, params![tx_hash, now_unix, id as i64])?;
         if n == 0 {
             return Err(anyhow!("set_tx({col}) on unknown deposit {id}"));
         }
@@ -109,7 +130,8 @@ impl DepositStore {
     }
 
     pub fn get(&self, id: u64) -> Result<Option<DepositRecord>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"SELECT id, user_eth, basket_id, miden_recipient, amount_usdc,
                       status, requested_at_unix, last_event_unix,
                       claim_tx, bridge_tx, miden_consume_tx, erc20_mint_tx,
@@ -126,7 +148,8 @@ impl DepositStore {
     /// Returns every deposit that is not yet in a terminal state. The
     /// resume loop on relay startup walks this set.
     pub fn list_open(&self) -> Result<Vec<DepositRecord>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             r#"SELECT id, user_eth, basket_id, miden_recipient, amount_usdc,
                       status, requested_at_unix, last_event_unix,
                       claim_tx, bridge_tx, miden_consume_tx, erc20_mint_tx,

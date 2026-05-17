@@ -1,19 +1,25 @@
-//! Stub entry point. The current scaffold doesn't watch a live RPC
-//! yet; it drives a single in-memory sample deposit through the full
-//! FSM using MockBridge + MockEthClient, so `cargo run` always
-//! exercises every transition.
+//! Darwin relay service entry point.
 //!
-//! Iteration 3 swaps the mocks for AlloyEthClient + AggLayerBridge +
-//! the real Miden submitter, and starts the alloy WS event watcher
-//! in parallel.
+//! Today this runs the full ingest+driver runtime against mocks
+//! (MockWatcher receives a few synthetic deposits, MockBridge +
+//! MockEthClient + MockMidenSubmitter handle the rest). Watch it
+//! drive each deposit to `Settled`, then exit when the watcher
+//! closes and the driver quiets.
+//!
+//! Iteration 4 swaps the mock surfaces for `AlloyWatcher` +
+//! `AlloyEthClient` + a Miden-live submitter, configurable via env
+//! vars (DARWIN_RPC_URL, DARWIN_RELAY_ADDR, etc.).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use darwin_relay::bridge::MockBridge;
 use darwin_relay::eth::MockEthClient;
+use darwin_relay::miden::MockMidenSubmitter;
+use darwin_relay::runtime::{spawn_runtime, RelayConfig};
 use darwin_relay::service::RelayService;
-use darwin_relay::state::DepositRecord;
 use darwin_relay::store::DepositStore;
+use darwin_relay::watcher::{MockWatcher, ObservedDeposit};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -27,39 +33,64 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(DepositStore::open_in_memory()?);
     let bridge = Arc::new(MockBridge::new());
     let eth = Arc::new(MockEthClient::new());
-    let svc = RelayService::new(store.clone(), bridge.clone(), eth.clone());
+    let miden = Arc::new(MockMidenSubmitter::new());
+    let svc = Arc::new(RelayService::new(
+        store.clone(),
+        bridge.clone(),
+        eth.clone(),
+        miden.clone(),
+    ));
 
+    let (watcher, watcher_handle) = MockWatcher::new(16);
+
+    let cfg = RelayConfig {
+        driver_tick: Duration::from_millis(50),
+        run_until_quiet: true,
+        quiet_after: Duration::from_millis(500),
+    };
+    let rt = spawn_runtime(cfg, store.clone(), watcher, svc);
+
+    // Push 3 sample deposits, then close the watcher.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let sample = DepositRecord::new(
-        1,
-        "0xBeefBeefBeefBeefBeefBeefBeefBeefBeefBeef".into(),
-        "0xDCC_basket_id_keccak256_placeholder".into(),
-        "0x0".into(),
-        1_000_000_000,
-        now,
-    );
-    store.insert(&sample)?;
-    tracing::info!("inserted sample deposit, driving it through the FSM…");
+    for id in 1..=3 {
+        watcher_handle
+            .push(ObservedDeposit {
+                id,
+                user_eth: format!("0xUser{id:040}"),
+                basket_id: "0xdcc_basket_id_placeholder".into(),
+                miden_recipient: "0x0".into(),
+                amount_usdc: 1_000_000_000 * id as u128, // 1k, 2k, 3k USDC
+                requested_at_unix: now,
+            })
+            .await;
+    }
+    watcher_handle.close();
 
-    let final_status = svc.drive(1).await?;
-    tracing::info!(?final_status, "deposit reached terminal state");
+    rt.join().await?;
 
-    let final_record = store.get(1)?.unwrap();
-    println!("\nFinal deposit state:");
-    println!("  id              {}", final_record.id);
-    println!("  status          {}", final_record.status.as_str());
-    println!("  amount_usdc     {}", final_record.amount_usdc);
-    println!("  claim_tx        {:?}", final_record.claim_tx);
-    println!("  bridge_tx       {:?}", final_record.bridge_tx);
-    println!("  miden_consume_tx {:?}", final_record.miden_consume_tx);
-    println!("  erc20_mint_tx   {:?}", final_record.erc20_mint_tx);
-    println!("  confirm_tx      {:?}", final_record.confirm_tx);
+    println!("\nFinal deposit ledger:");
+    for id in 1..=3 {
+        let r = store.get(id)?.unwrap();
+        println!(
+            "  id={} status={:<10} basket_amount={:?} claim={:?} mint={:?} confirm={:?}",
+            r.id,
+            r.status.as_str(),
+            r.basket_amount_minted,
+            r.claim_tx.as_deref().map(|s| &s[..14]),
+            r.erc20_mint_tx.as_deref().map(|s| &s[..14]),
+            r.confirm_tx.as_deref().map(|s| &s[..14]),
+        );
+    }
 
     println!("\nMockEthClient call trace:");
     for (i, call) in eth.calls().iter().enumerate() {
+        println!("  [{i}] {call:?}");
+    }
+    println!("\nMockMidenSubmitter call trace:");
+    for (i, call) in miden.calls().iter().enumerate() {
         println!("  [{i}] {call:?}");
     }
     Ok(())

@@ -35,6 +35,8 @@
 
 pub mod bridge;
 pub mod eth;
+pub mod miden;
+pub mod runtime;
 pub mod service;
 pub mod state;
 pub mod store;
