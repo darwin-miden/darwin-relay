@@ -9,8 +9,31 @@
 name      = "Sepolia"
 chain_id  = 11155111
 rpc_http  = "https://ethereum-sepolia-rpc.publicnode.com"
+rpc_ws    = "wss://ethereum-sepolia-rpc.publicnode.com"
 explorer  = "https://sepolia.etherscan.io"
 deployed  = "2026-05-17"
+
+# M2 Track 1 stack — DarwinStrategy registry + 3 basket tokens.
+# Deployed from darwin-bridge-adapter/contracts/script/DeployM2Stack.s.sol.
+# basketId = keccak256(symbol); registered in DarwinStrategy.
+[m2_strategy]
+address = "0x635E19c61CD09d145D57A88cE8185Ddf27fA356F"
+admin   = "0xf6d3C9Ed2115A5197F96f6189F6D63B51022Fe16"
+
+[m2_baskets.DCC]
+basket_id      = "0x1fbfef9aa7f4e8f8bd84b940396c9263c0c2ac2212f53759ceb3b71aaeed43fe"
+token_address  = "0x1EB7Bd808402824232853e66DF6843D68462B7A4"
+mint_authority = "0xf6d3C9Ed2115A5197F96f6189F6D63B51022Fe16"
+
+[m2_baskets.DAG]
+basket_id      = "0x74491929c2f72408e48b338222172a8a07d8c3087617d09881d00d72278eb6c1"
+token_address  = "0x73F18087dd45d180e75cADcD383479624326E336"
+mint_authority = "0xf6d3C9Ed2115A5197F96f6189F6D63B51022Fe16"
+
+[m2_baskets.DCO]
+basket_id      = "0xb2cbc4016a8155cd5b6be0c2683f937c73985e9bee24f6cb8e383f4967408757"
+token_address  = "0x6344469eB35Ff00d5892fD368727ad3C9E45677c"
+mint_authority = "0xf6d3C9Ed2115A5197F96f6189F6D63B51022Fe16"
 
 # DarwinRelayDeposit.sol — ETH-side escrow that holds user USDC
 # between `deposit` and `confirmDeposit`. See darwin-relay/contracts/.
@@ -61,3 +84,25 @@ deposit_tx        = "0x4bef9dc4b90b55f5105316469fedebfee8a8285b762558bce185a8729
 claim_tx          = "0x100be058a04af85b2c28621be7a76813dbe0fba5c0d0634631e7de5953e75ddd"
 final_status      = "refunded"
 refund_reason     = "unknown basket_id (relay BasketRegistry was empty in this run)"
+
+# Full Settled path — relay live with populated BasketRegistry pointing
+# at the M2 DCC token. Deposit fired via cast send, AlloyWatcher
+# caught it, AlloyEthClient walked the whole FSM (claim → mintTo
+# minted 249.25 DCC to user → confirm). The first confirm tx was
+# dropped because three sequential write txs from the same EOA
+# raced through publicnode's RPC nonce queue (known limitation of
+# fast burst sends — alloy's nonce filler doesn't always wait for
+# inclusion). The relay's transient-retry caught it and a manual
+# `cast send confirmDeposit` finished the path with status 3.
+[[live_runs]]
+label                 = "autonomous relay E2E into M2 DCC basket (Settled)"
+basket_symbol         = "DCC"
+basket_id             = "0x1fbfef9aa7f4e8f8bd84b940396c9263c0c2ac2212f53759ceb3b71aaeed43fe"
+basket_token          = "0x1EB7Bd808402824232853e66DF6843D68462B7A4"
+amount_usdc           = 250000000
+basket_minted         = 249250000
+deposit_tx            = "0x5be2e1b85d94a36d1f9d0b10aaf4dd7ce74308dfc3c16a7fba788d38c97b649f"
+claim_tx              = "0x63036da5f7565159c1364260cce5edbf2b5785d0951e913bed5816cff533e544"
+erc20_mint_tx         = "0xb7addb0e718ac9275f8fffb123b10c77e2e2a14e079578af67189830b66ba44f"
+confirm_tx            = "0x5ffb99dd4127a8bc3bea036d4d162881344e160359e7cdf0b26e169edfa6baf3"
+final_status          = "settled"
