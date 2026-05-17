@@ -34,6 +34,8 @@
 //! - [`service`]: tokio orchestrator that wires it all together
 
 pub mod bridge;
+pub mod eth;
 pub mod service;
 pub mod state;
 pub mod store;
+pub mod watcher;

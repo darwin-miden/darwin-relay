@@ -22,7 +22,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite    = { version = "0.37", features = ["bundled"] }
 
 # Ethereum side
-alloy       = { version = "1", features = ["full", "providers", "sol-types", "transports", "json-rpc"] }
+alloy       = { version = "1", features = ["full", "providers", "sol-types", "transports", "json-rpc", "contract", "rpc-types-eth", "signer-local", "network", "pubsub", "provider-ws"] }
+futures     = "0.3"
+hex         = "0.4"
 
 # Miden side (optional for the demo build — gated until we wire it)
 [dependencies.miden-client]

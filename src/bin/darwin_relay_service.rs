@@ -1,14 +1,16 @@
 //! Stub entry point. The current scaffold doesn't watch a live RPC
-//! yet; it prints the deposit FSM + bridge mock state so we have a
-//! smoke target on `cargo run --bin darwin_relay_service`.
+//! yet; it drives a single in-memory sample deposit through the full
+//! FSM using MockBridge + MockEthClient, so `cargo run` always
+//! exercises every transition.
 //!
-//! Iteration 2 wires up the alloy WS subscriber on the
-//! `RelayDepositRequested` event and starts the driver loop in
-//! parallel.
+//! Iteration 3 swaps the mocks for AlloyEthClient + AggLayerBridge +
+//! the real Miden submitter, and starts the alloy WS event watcher
+//! in parallel.
 
 use std::sync::Arc;
 
 use darwin_relay::bridge::MockBridge;
+use darwin_relay::eth::MockEthClient;
 use darwin_relay::service::RelayService;
 use darwin_relay::state::DepositRecord;
 use darwin_relay::store::DepositStore;
@@ -24,9 +26,9 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Arc::new(DepositStore::open_in_memory()?);
     let bridge = Arc::new(MockBridge::new());
-    let svc = RelayService::new(store.clone(), bridge.clone());
+    let eth = Arc::new(MockEthClient::new());
+    let svc = RelayService::new(store.clone(), bridge.clone(), eth.clone());
 
-    // Simulate an inbound RelayDepositRequested event for the smoke run.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -35,8 +37,8 @@ async fn main() -> anyhow::Result<()> {
         1,
         "0xBeefBeefBeefBeefBeefBeefBeefBeefBeefBeef".into(),
         "0xDCC_basket_id_keccak256_placeholder".into(),
-        "0x0".into(), // no Miden recipient — wrapped ERC20 path
-        1_000_000_000, // 1000 USDC at 6 decimals
+        "0x0".into(),
+        1_000_000_000,
         now,
     );
     store.insert(&sample)?;
@@ -56,9 +58,9 @@ async fn main() -> anyhow::Result<()> {
     println!("  erc20_mint_tx   {:?}", final_record.erc20_mint_tx);
     println!("  confirm_tx      {:?}", final_record.confirm_tx);
 
-    println!("\nMock bridge snapshot:");
-    for (bref, id, amount, status) in bridge.snapshot() {
-        println!("  {bref}  deposit={id}  amount={amount}  status={status:?}");
+    println!("\nMockEthClient call trace:");
+    for (i, call) in eth.calls().iter().enumerate() {
+        println!("  [{i}] {call:?}");
     }
     Ok(())
 }

@@ -1794,6 +1794,8 @@ dependencies = [
  "alloy",
  "anyhow",
  "async-trait",
+ "futures",
+ "hex",
  "miden-client",
  "miden-client-sqlite-store",
  "miden-protocol",
