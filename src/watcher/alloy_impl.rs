@@ -35,7 +35,16 @@ sol! {
 
 pub struct AlloyWatcher {
     rx: mpsc::Receiver<ObservedDeposit>,
+    // Keep the provider alive for the lifetime of the subscription.
+    // Without this the alloy pubsub service shuts down as soon as
+    // `start` returns and the WS connection closes.
+    _provider: Box<dyn ProviderHolder>,
 }
+
+/// Erased provider holder so the concrete WsProvider type doesn't
+/// leak into the watcher's public API.
+trait ProviderHolder: Send + Sync {}
+impl<T: Send + Sync + 'static> ProviderHolder for T {}
 
 impl AlloyWatcher {
     /// Start a background tokio task that subscribes to logs on
@@ -76,8 +85,12 @@ impl AlloyWatcher {
                     break;
                 }
             }
+            tracing::warn!("alloy watcher stream ended");
         });
-        Ok(Self { rx })
+        Ok(Self {
+            rx,
+            _provider: Box::new(provider),
+        })
     }
 }
 

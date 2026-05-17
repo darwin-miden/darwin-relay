@@ -19,9 +19,6 @@ use anyhow::Result;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::bridge::BridgeClient;
-use crate::eth::EthClient;
-use crate::miden::MidenSubmitter;
 use crate::service::RelayService;
 use crate::state::DepositRecord;
 use crate::store::DepositStore;
@@ -66,18 +63,12 @@ impl RelayHandle {
 /// Spawn the ingest + driver loops for a relay configured with the
 /// given watcher / bridge / eth / miden impls. Returns a handle the
 /// caller can await on.
-pub fn spawn_runtime<W, B, E, M>(
+pub fn spawn_runtime(
     config: RelayConfig,
     store: Arc<DepositStore>,
-    mut watcher: W,
-    svc: Arc<RelayService<B, E, M>>,
-) -> RelayHandle
-where
-    W: DepositWatcher + Send + 'static,
-    B: BridgeClient + 'static,
-    E: EthClient + 'static,
-    M: MidenSubmitter + 'static,
-{
+    mut watcher: Box<dyn DepositWatcher + Send>,
+    svc: Arc<RelayService>,
+) -> RelayHandle {
     let ingest_store = store.clone();
     let ingest_cfg = config.clone();
     let ingest = tokio::spawn(async move {
@@ -179,7 +170,7 @@ mod tests {
             run_until_quiet: true,
             quiet_after: Duration::from_millis(200),
         };
-        let rt = spawn_runtime(cfg, store.clone(), watcher, svc);
+        let rt = spawn_runtime(cfg, store.clone(), Box::new(watcher), svc);
 
         // Push 3 deposits, then close the watcher so ingest can drain.
         for id in 1..=3 {
@@ -216,7 +207,7 @@ mod tests {
             run_until_quiet: true,
             quiet_after: Duration::from_millis(200),
         };
-        let rt = spawn_runtime(cfg, store.clone(), watcher, svc);
+        let rt = spawn_runtime(cfg, store.clone(), Box::new(watcher), svc);
 
         handle.push(obs(1)).await;
         handle.push(obs(2)).await; // will fail on claim

@@ -35,7 +35,7 @@ faucet   = "MockUSDC.mint(to, amount) — anyone can mint to themselves"
 # USDC (3 bps mint-fee simulation). Operator and deployer are the
 # same address here, so the released USDC returns to the same EOA.
 [[live_runs]]
-label             = "deposit + claim + confirm full path"
+label             = "deposit + claim + confirm full path (manual cast)"
 basket_id         = "0xc7a4b1b0e9c1e2b8ce99e7e1be2c4c5c3d3a8c1e7b5e8d4d5e3a9c2d8b4e6f01"
 amount_usdc       = 1000000000
 basket_minted     = 997000000
@@ -44,3 +44,20 @@ deposit_block     = 10869397
 claim_tx          = "0xfc285725044ccc1532e5a1c60c41631ed382dafc69b7b6c244260a55cd336f4e"
 confirm_tx        = "0x4b4b41a81cafc451ad4902b921cbe7d3b85b583d721eba9d186040c27d0ff8a4"
 final_status      = "settled"
+
+# Iter 4b end-to-end: a fresh deposit was fired via `cast send` while
+# `darwin_relay_service --mode live` was running with AlloyWatcher +
+# AlloyEthClient + MockMidenSubmitter. The relay autonomously caught
+# the RelayDepositRequested log on the WS subscription, called
+# claimDeposit, advanced the FSM through the (mock) Miden mint leg,
+# then routed to refund because the basket id wasn't in the empty
+# BasketRegistry. refundDeposit landed on Sepolia and the on-chain
+# status flipped to Refunded (5). USDC returned to the user.
+[[live_runs]]
+label             = "autonomous relay E2E (alloy watcher + claim + refund)"
+basket_id         = "0xc7a4b1b0e9c1e2b8ce99e7e1be2c4c5c3d3a8c1e7b5e8d4d5e3a9c2d8b4e6f01"
+amount_usdc       = 500000000
+deposit_tx        = "0x4bef9dc4b90b55f5105316469fedebfee8a8285b762558bce185a87296255684"
+claim_tx          = "0x100be058a04af85b2c28621be7a76813dbe0fba5c0d0634631e7de5953e75ddd"
+final_status      = "refunded"
+refund_reason     = "unknown basket_id (relay BasketRegistry was empty in this run)"

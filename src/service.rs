@@ -25,22 +25,20 @@ use crate::miden::{MidenError, MidenSubmitter};
 use crate::state::{DepositRecord, DepositStatus};
 use crate::store::{DepositStore, TxColumn};
 
-pub struct RelayService<B: BridgeClient, E: EthClient, M: MidenSubmitter> {
+pub struct RelayService {
     pub store: Arc<DepositStore>,
-    pub bridge: Arc<B>,
-    pub eth: Arc<E>,
-    pub miden: Arc<M>,
+    pub bridge: Arc<dyn BridgeClient>,
+    pub eth: Arc<dyn EthClient>,
+    pub miden: Arc<dyn MidenSubmitter>,
     pub tick: Duration,
 }
 
-impl<B: BridgeClient + 'static, E: EthClient + 'static, M: MidenSubmitter + 'static>
-    RelayService<B, E, M>
-{
+impl RelayService {
     pub fn new(
         store: Arc<DepositStore>,
-        bridge: Arc<B>,
-        eth: Arc<E>,
-        miden: Arc<M>,
+        bridge: Arc<dyn BridgeClient>,
+        eth: Arc<dyn EthClient>,
+        miden: Arc<dyn MidenSubmitter>,
     ) -> Self {
         Self {
             store,
@@ -251,13 +249,18 @@ mod tests {
         Arc<MockBridge>,
         Arc<MockEthClient>,
         Arc<MockMidenSubmitter>,
-        RelayService<MockBridge, MockEthClient, MockMidenSubmitter>,
+        RelayService,
     ) {
         let store = Arc::new(DepositStore::open_in_memory().unwrap());
         let bridge = Arc::new(MockBridge::new());
         let eth = Arc::new(MockEthClient::new());
         let miden = Arc::new(MockMidenSubmitter::new());
-        let svc = RelayService::new(store.clone(), bridge.clone(), eth.clone(), miden.clone());
+        let svc = RelayService::new(
+            store.clone(),
+            bridge.clone(),
+            eth.clone(),
+            miden.clone(),
+        );
         (store, bridge, eth, miden, svc)
     }
 
@@ -294,7 +297,12 @@ mod tests {
         let bridge = Arc::new(MockBridge::new());
         let eth = Arc::new(MockEthClient::new().fail_on_claim(7));
         let miden = Arc::new(MockMidenSubmitter::new());
-        let svc = RelayService::new(store.clone(), bridge, eth.clone(), miden);
+        let svc = RelayService::new(
+            store.clone(),
+            bridge,
+            eth.clone(),
+            miden,
+        );
         store.insert(&sample(7)).unwrap();
 
         let final_status = svc.drive(7).await.unwrap();
@@ -311,7 +319,12 @@ mod tests {
         let bridge = Arc::new(MockBridge::new().fail_on_amount(1_000_000));
         let eth = Arc::new(MockEthClient::new());
         let miden = Arc::new(MockMidenSubmitter::new());
-        let svc = RelayService::new(store.clone(), bridge, eth, miden);
+        let svc = RelayService::new(
+            store.clone(),
+            bridge,
+            eth,
+            miden,
+        );
         store.insert(&sample(3)).unwrap();
 
         assert_eq!(svc.drive(3).await.unwrap(), DepositStatus::Refunded);
@@ -324,7 +337,12 @@ mod tests {
         let bridge = Arc::new(MockBridge::new());
         let eth = Arc::new(MockEthClient::new());
         let miden = Arc::new(MockMidenSubmitter::new().fail_on_basket("0xbasket"));
-        let svc = RelayService::new(store.clone(), bridge, eth.clone(), miden);
+        let svc = RelayService::new(
+            store.clone(),
+            bridge,
+            eth.clone(),
+            miden,
+        );
         store.insert(&sample(4)).unwrap();
 
         assert_eq!(svc.drive(4).await.unwrap(), DepositStatus::Refunded);
@@ -340,7 +358,12 @@ mod tests {
         let bridge = Arc::new(MockBridge::with_delay(60));
         let eth = Arc::new(MockEthClient::new());
         let miden = Arc::new(MockMidenSubmitter::new());
-        let svc = RelayService::new(store.clone(), bridge, eth, miden);
+        let svc = RelayService::new(
+            store.clone(),
+            bridge,
+            eth,
+            miden,
+        );
         store.insert(&sample(2)).unwrap();
 
         assert_eq!(svc.drive(2).await.unwrap(), DepositStatus::Settled);

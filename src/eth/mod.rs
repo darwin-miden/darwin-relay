@@ -11,7 +11,9 @@
 mod alloy_impl;
 mod mock;
 
-pub use alloy_impl::{connect_http_alloy_eth_client, AlloyEthClient, BasketRegistry};
+pub use alloy_impl::{
+    connect_http_alloy_eth_client, AlloyEthClient, BasketRegistry, LiveEthConfig,
+};
 pub use mock::{MockCall, MockEthClient};
 
 use async_trait::async_trait;

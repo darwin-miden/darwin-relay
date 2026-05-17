@@ -38,6 +38,56 @@ sol! {
 /// to the deployed `DarwinBasketToken` contract address.
 pub type BasketRegistry = HashMap<String, Address>;
 
+/// Configuration the binary uses to bring up the live ETH side. All
+/// fields are required; the binary falls back to mock if any is
+/// unset.
+#[derive(Debug, Clone)]
+pub struct LiveEthConfig {
+    /// HTTP(S) JSON-RPC URL for write transactions (claim, confirm,
+    /// refund, mintTo). Example: https://ethereum-sepolia-rpc.publicnode.com
+    pub rpc_http: String,
+    /// WebSocket JSON-RPC URL for event subscription. Example:
+    /// wss://ethereum-sepolia-rpc.publicnode.com
+    pub rpc_ws: String,
+    /// Operator EOA private key (0x… 32 bytes). Signs every write tx.
+    pub operator_key_hex: String,
+    /// Deployed `DarwinRelayDeposit` contract address.
+    pub relay_address: Address,
+    /// Optional basket-id → DarwinBasketToken map. For iter 4 we run
+    /// with an empty map and let MintTo legs route to Refunded —
+    /// proves the ETH wire works even though basket tokens aren't
+    /// deployed yet.
+    pub baskets: BasketRegistry,
+}
+
+impl LiveEthConfig {
+    pub fn from_env() -> Option<Self> {
+        let rpc_http = std::env::var("DARWIN_RELAY_ETH_RPC_HTTP").ok()?;
+        let rpc_ws = std::env::var("DARWIN_RELAY_ETH_RPC_WS").ok()?;
+        let operator_key_hex = std::env::var("DARWIN_RELAY_ETH_OPERATOR_KEY").ok()?;
+        let relay_address: Address = std::env::var("DARWIN_RELAY_ETH_CONTRACT")
+            .ok()?
+            .parse()
+            .ok()?;
+        let baskets = std::env::var("DARWIN_RELAY_ETH_BASKETS")
+            .ok()
+            .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
+            .map(|m| {
+                m.into_iter()
+                    .filter_map(|(k, v)| v.parse::<Address>().ok().map(|a| (k, a)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(Self {
+            rpc_http,
+            rpc_ws,
+            operator_key_hex,
+            relay_address,
+            baskets,
+        })
+    }
+}
+
 pub struct AlloyEthClient<P>
 where
     P: Provider<Ethereum> + Clone + Send + Sync + 'static,
