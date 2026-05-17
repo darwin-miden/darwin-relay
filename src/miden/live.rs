@@ -9,6 +9,21 @@
 //! Send-safe handle.
 //!
 //! Gated behind the `miden-live` Cargo feature.
+//!
+//! ## Known testnet stability gotcha
+//!
+//! miden-client 0.14.8 occasionally panics with
+//! `"MMR peaks stored for a block header must use that block number
+//! as the forest"` when a store that was last synced at a much
+//! older height tries to catch up across thousands of blocks. The
+//! relay handles this gracefully — the panic kills the worker
+//! thread, the next `submit_deposit` call returns
+//! `MidenError::Permanent("worker dropped reply")`, and the FSM
+//! routes the deposit to `Refunded`.
+//!
+//! For a smoother run-out from a fresh store, either (a) keep the
+//! store small with frequent prunes, or (b) bump miden-client when
+//! the upstream fix lands.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,9 +58,14 @@ impl LiveMidenConfig {
             relay_wallet_hex: std::env::var("DARWIN_RELAY_MIDEN_WALLET").ok()?,
             controller_hex: std::env::var("DARWIN_RELAY_MIDEN_CONTROLLER").ok()?,
             stable_faucet_hex: std::env::var("DARWIN_RELAY_MIDEN_STABLE_FAUCET").ok()?,
+            // Default to the global miden-client store so we can see
+            // the relay wallet (private accounts can't be imported
+            // from the network — they only live where they were
+            // created). Override with DARWIN_RELAY_MIDEN_STORE if
+            // you want isolation.
             store_path: std::env::var("DARWIN_RELAY_MIDEN_STORE")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| format!("{home}/.miden/darwin_relay.sqlite3").into()),
+                .unwrap_or_else(|_| format!("{home}/.miden/store.sqlite3").into()),
             keystore_path: std::env::var("DARWIN_RELAY_MIDEN_KEYSTORE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| format!("{home}/.miden/keystore").into()),
@@ -145,7 +165,9 @@ impl WorkerState {
             .map_err(|e| MidenError::Permanent(format!("controller_hex: {e}")))?;
         let stable_faucet = AccountId::from_hex(&cfg.stable_faucet_hex)
             .map_err(|e| MidenError::Permanent(format!("stable_faucet_hex: {e}")))?;
-        let _ = std::fs::remove_file(&cfg.store_path);
+        // Open (don't recreate) the configured store — when pointing at
+        // the shared ~/.miden/store.sqlite3 we'd otherwise wipe the
+        // relay wallet that lives only there.
         let store = SqliteStore::new(cfg.store_path.clone())
             .await
             .map_err(|e| MidenError::Transient(format!("store init: {e}")))?;
