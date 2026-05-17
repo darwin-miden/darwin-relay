@@ -1,0 +1,56 @@
+[package]
+name = "darwin-relay"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Darwin Relay service: watches DarwinRelayDeposit.sol on ETH, bridges to a Miden operator account, mints private basket positions, mints wrapped ERC20 back to the user."
+repository = "https://github.com/darwin-miden/darwin-relay"
+
+[dependencies]
+anyhow      = "1"
+async-trait = "0.1"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+thiserror   = "1"
+tokio       = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Persistence — version aligned with miden-client-sqlite-store 0.14
+# so the optional `miden-live` feature can be enabled without dep
+# conflicts on libsqlite3-sys.
+rusqlite    = { version = "0.37", features = ["bundled"] }
+
+# Ethereum side
+alloy       = { version = "1", features = ["full", "providers", "sol-types", "transports", "json-rpc"] }
+
+# Miden side (optional for the demo build — gated until we wire it)
+[dependencies.miden-client]
+version  = "0.14"
+features = ["tonic"]
+optional = true
+
+[dependencies.miden-client-sqlite-store]
+version  = "0.14"
+optional = true
+
+[dependencies.miden-protocol]
+version  = "0.14"
+optional = true
+
+[features]
+default = []
+# Real Miden-client integration. Off by default so the deposit FSM
+# + MockBridge tests stay fast and self-contained.
+miden-live = [
+    "dep:miden-client",
+    "dep:miden-client-sqlite-store",
+    "dep:miden-protocol",
+]
+
+[[bin]]
+name = "darwin_relay_service"
+path = "src/bin/darwin_relay_service.rs"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

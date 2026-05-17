@@ -1,0 +1,7 @@
+/target
+/out
+/cache
+Cargo.lock.bak
+*.sqlite3
+*.sqlite3-journal
+.DS_Store
