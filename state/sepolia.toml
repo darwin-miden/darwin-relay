@@ -1,0 +1,46 @@
+# Darwin Relay — Sepolia deployment registry.
+#
+# Source of truth for the addresses the relay service reads via env
+# vars (DARWIN_RELAY_ETH_CONTRACT, DARWIN_RELAY_DEPOSIT_TOKEN, etc.).
+# Updated by contracts/script/DeployRelay.s.sol; treat as
+# generated-but-committed.
+
+[network]
+name      = "Sepolia"
+chain_id  = 11155111
+rpc_http  = "https://ethereum-sepolia-rpc.publicnode.com"
+explorer  = "https://sepolia.etherscan.io"
+deployed  = "2026-05-17"
+
+# DarwinRelayDeposit.sol — ETH-side escrow that holds user USDC
+# between `deposit` and `confirmDeposit`. See darwin-relay/contracts/.
+[relay]
+address       = "0x7e5279AD0d9F7fB8884562C336Fa6d78DCbf7c93"
+admin         = "0xf6d3C9Ed2115A5197F96f6189F6D63B51022Fe16"
+operator      = "0xf6d3C9Ed2115A5197F96f6189F6D63B51022Fe16"
+deposit_token = "0x6dAb940a4E1d434965E22e9F6d624fF68F6922a0"
+claim_window  = "1h"
+
+# MockUSDC deployed alongside the relay since Sepolia has no canonical
+# USDC. 6 decimals. Deployer holds 1_000_000 MockUSDC initial mint.
+[deposit_token]
+address  = "0x6dAb940a4E1d434965E22e9F6d624fF68F6922a0"
+symbol   = "USDC"
+decimals = 6
+faucet   = "MockUSDC.mint(to, amount) — anyone can mint to themselves"
+
+# Full state-machine walk on Sepolia validating the escrow's three
+# operator paths. The deposit was for 1000 USDC into a placeholder
+# basket id; basket_amount_minted recorded at confirm time was 997
+# USDC (3 bps mint-fee simulation). Operator and deployer are the
+# same address here, so the released USDC returns to the same EOA.
+[[live_runs]]
+label             = "deposit + claim + confirm full path"
+basket_id         = "0xc7a4b1b0e9c1e2b8ce99e7e1be2c4c5c3d3a8c1e7b5e8d4d5e3a9c2d8b4e6f01"
+amount_usdc       = 1000000000
+basket_minted     = 997000000
+deposit_tx        = "0x702be6b976207326c37f14760e4860db3def29edf8419738808bc0a7c23b32e2"
+deposit_block     = 10869397
+claim_tx          = "0xfc285725044ccc1532e5a1c60c41631ed382dafc69b7b6c244260a55cd336f4e"
+confirm_tx        = "0x4b4b41a81cafc451ad4902b921cbe7d3b85b583d721eba9d186040c27d0ff8a4"
+final_status      = "settled"
