@@ -7,12 +7,16 @@ Miden key.
 
 ## Why
 
-The grant for Milestone 2 originally referenced Near Intents +
-Miden Guardian as the canonical onboarding stack for ETH users. As
-of 2026-05-17 Near Intents does not list Miden as a destination chain,
-and Miden Guardian is a non-custodial state-coordinator (it never
-moves funds for users). Until those land in their canonical forms,
-Darwin operates its own minimal relay so the M2 flow ships.
+ETH-native users shouldn't have to install a Miden wallet, manage a
+Falcon-512 key, or run a STARK prover just to hold a basket position.
+darwin-relay sits between the user's Ethereum wallet and the Miden
+protocol so the user experience is "deposit USDC, get basket ERC20",
+nothing more.
+
+Near Intents doesn't list Miden as a destination chain today, and
+Miden Guardian is a non-custodial state-coordinator (it never moves
+funds for users). Until those land in their canonical forms, Darwin
+operates this minimal relay so the flow ships.
 
 ## Architecture
 
