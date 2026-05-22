@@ -172,3 +172,24 @@ dest_address    = "0x00000000eD3cD5beFa3207805f8529207CfC0D00"
 miden_recipient = "0xed3cd5befa3207805f8529207cfc0d"
 ready_for_claim = false   # ~15 min after broadcast
 note            = "first live agglayer L1->L2 deposit; awaiting claim note issuance"
+
+# Update 2026-05-22 21:00 UTC: agglayer claim-note issuance is slower
+# than the docs' 15-min budget. Deposit still pending (~35 min in).
+# bridge-out-tool built locally from gateway-fm/miden-agglayer with
+# the same pin set the Bali deployment uses:
+#   miden-client      = "v0.14.7"   (git tag)
+#   miden-base        = "=0.14.4"
+#   miden-protocol    = "=0.14.4"
+#   miden-standards   = "=0.14.4"
+#   miden-tx          = "=0.14.4"
+#   miden-assembly    = "=0.22.1"
+#   miden-core        = "=0.22.1"
+#   miden-node binary = "0.14.10"
+# binary: /tmp/miden-agglayer/target/release/bridge-out-tool
+[bali_agglayer.bridge_out_tool]
+binary             = "gateway-fm/miden-agglayer/target/release/bridge-out-tool"
+miden_client_tag   = "v0.14.7"
+miden_base_pin     = "0.14.4"
+miden_assembly_pin = "0.22.1"
+miden_node_binary  = "0.14.10"
+status             = "built locally, awaiting funded Miden wallet from the L1->L2 claim"
