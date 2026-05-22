@@ -124,3 +124,51 @@ erc20_mint_tx         = "0x7af144ba2813ad9f7bb5f0ba32a1994c3994ded70417e35727a45
 confirm_tx            = "0x655a1d8583580d1b7ae9e4bb9ab9cbb51e1a1d8c61d401ce929bf0c8d5c72855"
 final_status          = "settled"
 notes                 = "iter5 receipt-await fix; 65s end-to-end; user got 199.4 DAG"
+
+# ---------------------------------------------------------------------
+# 2026-05-22: Devrel-published Sepolia <-> Miden integrations.
+#
+# Two new paths land here, both verified live the same day:
+#   - oneclick_mock: NEAR Intents 1Click shape via Brian Seong's mock
+#     bridge. End-to-end Sepolia -> Miden in ~70s. Local docker.
+#   - bali_agglayer: real gateway-fm/miden-agglayer deployment on Bali
+#     (Miden's public testnet rollup). Real canonical bridge contract;
+#     ~15 min for the agglayer to issue the claim note.
+# ---------------------------------------------------------------------
+
+[oneclick_mock]
+repo            = "https://github.com/BrianSeong99/miden-testnet-bridge"
+local_url       = "http://localhost:8080"
+api_shape       = "NEAR Intents 1Click /v0/*"
+runs            = 1
+
+[[oneclick_mock.live_runs]]
+correlation_id  = "c37538b0-ff62-4352-81e3-b0260ca09945"
+amount_in_wei   = "10000000000000"
+amount_out_wei  = "10000000000000"
+sepolia_tx      = "0xeaf06e1914ee39e95556594140e1509c04f9317177306d51782cc69eddc6f9f0"
+miden_recipient = "0xed3cd5befa3207805f8529207cfc0d"
+status          = "SUCCESS"
+total_seconds   = 70
+note            = "first end-to-end run of the published mock 1Click bridge"
+
+[bali_agglayer]
+sepolia_bridge_contract = "0x1348947e282138d8f377b467f7d9c2eb0f335d1f"
+bridge_service_api      = "https://miden-testnet-bridge.dev.eu-north-3.gateway.fm/api"
+dest_network            = 73
+miden_bridge_account    = "mtst1aqn4y5pyessyw5rukd0wnmgq6srmn7np"
+miden_eth_faucet        = "mtst1az5g5k0tj7vsqcrp90z2dshsmskhyely"
+miden_node_url          = "https://rpc.testnet.miden.io:443"
+docs_pr                 = "https://github.com/0xMiden/miden-client/pull/2173"
+
+[[bali_agglayer.live_runs]]
+direction       = "L1 -> L2"
+amount_wei      = "1000000000000000"
+sepolia_tx      = "0x2479ab540f4d070cd9b8b5cb9dff9208c450c9cbada94c8bd4bba363a6a1ee9a"
+sepolia_block   = 10899524
+deposit_cnt     = 1132347
+dest_network    = 73
+dest_address    = "0x00000000eD3cD5beFa3207805f8529207CfC0D00"
+miden_recipient = "0xed3cd5befa3207805f8529207cfc0d"
+ready_for_claim = false   # ~15 min after broadcast
+note            = "first live agglayer L1->L2 deposit; awaiting claim note issuance"
