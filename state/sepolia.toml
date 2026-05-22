@@ -193,3 +193,42 @@ miden_base_pin     = "0.14.4"
 miden_assembly_pin = "0.22.1"
 miden_node_binary  = "0.14.10"
 status             = "built locally, awaiting funded Miden wallet from the L1->L2 claim"
+
+# ---------------------------------------------------------------------
+# 2026-05-22 deep-investigation results.
+#
+# Q: Why is the Bali agglayer L1->L2 not flipping ready_for_claim?
+# A: gateway-fm's hosted bridge-service indexer is stuck.
+#    L1 contract `lastUpdatedDepositCount()` returns 1132363 (fresh).
+#    `/api/merkle-proof?deposit_cnt=N` returns "not synchronized
+#    deposit" for ALL N except a single sentinel at cnt=1132000.
+#    Our deposit 1132347 + 12 neighbors all unsynced. The indexer
+#    appears frozen on a snapshot of root 0xbb7f8b38..., while L1
+#    has progressed to root 0x6a2a9c4b... since then.
+# Action: not our infra; tooling is ready, run again when service
+# catches up. Sent observation to Brian + included L1 contract refs.
+# ---------------------------------------------------------------------
+
+# Mock 1Click full bidirectional run via sepolia_e2e binary (2026-05-22).
+# Both inbound (Sepolia -> Miden) and outbound (Miden -> Sepolia)
+# exercised end-to-end through the published mock 1Click API.
+[[oneclick_mock.live_runs]]
+direction         = "Sepolia -> Miden"
+correlation_id    = "8b4a494e-ac16-4c00-9d09-d1de84047d83"
+amount_in_wei     = "5000000000000"
+sepolia_tx        = "0x95fa8797cd34fce3f46b8e5809e31831c4e4d636201cded612ac81e2c9a2ee62"
+miden_recipient   = "0xed3cd5befa3207805f8529207cfc0d"
+status            = "SUCCESS"
+total_seconds     = 40
+note              = "fast inbound after fresh seed restart"
+
+[[oneclick_mock.live_runs]]
+direction               = "Miden -> Sepolia"
+correlation_id          = "ded7762b-4731-417a-a533-eeb4446e0761"
+amount_wei              = "1000000000000"
+miden_outbound_note     = "0xab7f8038cbe2cf2651d7ca38f79ca3abb3be390e18dbca6503242fda18c63d40"
+miden_consume_tx        = "0xb73a2f09c043c0a41cc1f8232b74d3ab175c8aafd3215be083fe7d1cf5e658e6"
+sepolia_release_tx      = "0xc0d4161e596e7cf515c135115e87d86ea85f001b1ab57845e7075e190b438e86"
+status_at_logged_time   = "PROCESSING"
+miden_settlement_seconds = 12
+note                    = "bridge logic completed; Sepolia release tx in mempool, pending mempool clearance (current Sepolia base fee tightness)"
