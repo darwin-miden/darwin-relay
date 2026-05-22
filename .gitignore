@@ -7,3 +7,7 @@ Cargo.lock.bak
 *.sqlite3-journal
 .DS_Store
 .env
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm

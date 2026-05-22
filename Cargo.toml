@@ -50,14 +50,42 @@ miden-live = [
     "dep:miden-protocol",
     "dep:miden-tx",
 ]
+# v2 relay binary (Miden-side custodial wallet + 1Click listener).
+# Separate feature so the v1 binary keeps building without the new
+# HTTP server / 1Click client deps.
+v2 = [
+    "dep:axum",
+    "dep:uuid",
+    "dep:reqwest",
+]
 
 [dependencies.miden-tx]
 version  = "0.14"
 optional = true
 
+[dependencies.axum]
+version = "0.7"
+optional = true
+
+[dependencies.uuid]
+version  = "1"
+features = ["v4", "serde"]
+optional = true
+
+[dependencies.reqwest]
+version          = "0.12"
+default-features = false
+features         = ["json", "rustls-tls"]
+optional         = true
+
 [[bin]]
 name = "darwin_relay_service"
 path = "src/bin/darwin_relay_service.rs"
+
+[[bin]]
+name              = "darwin_relay_v2"
+path              = "src/bin/darwin_relay_v2.rs"
+required-features = ["v2"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
