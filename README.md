@@ -1,106 +1,97 @@
 # darwin-relay
 
-ETH-side escrow plus a Miden-side operator wallet that lets an
-ETH-native user deposit USDC and end up holding a wrapped Darwin
-basket ERC20 on Ethereum, without ever touching Miden or managing a
-Miden key.
+A Miden-side custodial wallet that lets an ETH-native user deposit
+ETH and end up holding a Darwin basket position natively on Miden,
+without ever managing a Miden key.
 
-## Why
+Two binaries live in this repo:
 
-ETH-native users shouldn't have to install a Miden wallet, manage a
-Falcon-512 key, or run a STARK prover just to hold a basket position.
-darwin-relay sits between the user's Ethereum wallet and the Miden
-protocol so the user experience is "deposit USDC, get basket ERC20",
-nothing more.
+| Binary | Path | Role | Default port |
+|---|---|---|---|
+| `darwin_relay_v2` | `src/bin/darwin_relay_v2.rs` | **Current.** Miden-side custodial wallet brokered by NEAR Intents 1Click. The relay is the 1Click bridge recipient and holds the basket-token position on the user's behalf, keyed by their EVM address. | `0.0.0.0:8090` |
+| `darwin_relay_service` | `src/bin/darwin_relay_service.rs` | Historical. Sepolia escrow + wDCC wrapped-ERC20 path from M2. Kept buildable for reference; no longer wired into the frontend. | n/a |
 
-Near Intents doesn't list Miden as a destination chain today, and
-Miden Guardian is a non-custodial state-coordinator (it never moves
-funds for users). Until those land in their canonical forms, Darwin
-operates this minimal relay so the flow ships.
+The v2 design is described in [`SPEC-v2.md`](SPEC-v2.md). Why the
+reshape: the original v1 collapsed three roles (bridge, relay wallet,
+AggLayer) into a single Sepolia escrow + a wrapped ERC20. With
+BrianSeong99/miden-testnet-bridge (a NEAR Intents 1Click mock for
+Miden) and Bali AggLayer reachable, the proposal's native shape is
+implementable — the bridge is delegated to 1Click and `darwin-relay`
+collapses back to just the Miden-side custodial layer.
 
-## Architecture
+## v2 — REST surface
 
-```text
-   ETH user
-     │ approve + deposit(USDC, basketId, midenRecipient)
-     ▼
-   DarwinRelayDeposit.sol  ── RelayDepositRequested ──►  darwin-relay
-     │                                                       │
-     │                                                       │ bridge USDC
-     │                                                       │ AggLayer or Mock
-     │                                                       ▼
-     │                                              Relay wallet on Miden
-     │                                                       │ build DepositNote
-     │                                                       ▼
-     │                                              v4 controller consumes
-     │                                                       │ basket position minted (private)
-     │                                                       │
-     │ confirmDeposit(id, basketAmountMinted)                │
-     │◄──────────────────────────────────────────────────────┘
-     ▼
-   DarwinBasketToken.mintTo(user, basketAmount)
+```
+POST /v0/intents               { user_evm_addr, basket_symbol, amount_in_wei }
+                                 → { correlation_id, relay_miden_address, expires_at }
+
+GET  /v0/intents/:id           → full intent record
+POST /v0/intents/:id/deposit   { deposit_address, sepolia_tx }
+                                 → { ok, stage }
+
+POST /v0/redeem                { user_evm_addr, basket_symbol, basket_amount }
+                                 → { redemption_id, stage }
+GET  /v0/redeem/:id            → full redemption record
+
+GET  /v0/positions/:evm_addr   → list of relay-held basket positions
+GET  /health
 ```
 
-The user surface is a single ETH transaction (`deposit`). All the
-Miden plumbing happens in the relay service, paid for by the deposit
-itself.
+## v2 — state machine
 
-## Components
-
-| Path | What |
-|---|---|
-| `contracts/DarwinRelayDeposit.sol` | ETH escrow with claim/confirm/cancel/refund state machine |
-| `contracts/test/DarwinRelayDeposit.t.sol` | 25 Foundry tests covering every transition |
-| `src/state.rs` | Deposit FSM types: 9 states (Requested → Settled / Refunded / Cancelled) |
-| `src/bridge/mod.rs` | `BridgeClient` trait + `MockBridge` impl |
-| `src/store.rs` | SQLite-backed persistence + resume loop |
-| `src/service.rs` | tokio orchestrator that drives each deposit through its FSM |
-| `src/bin/darwin_relay_service.rs` | Smoke entry point (inserts a sample deposit + drives it) |
-
-## State machine
-
-```text
-   Requested  ─claim→  Claimed  ─bridge→  BridgeInFlight  ─poll→  BridgedToMiden
-                                                                       │
-                                                                       │ depositNote
-                                                                       ▼
-                                                                  MidenMinted
-                                                                       │
-                                                                       │ erc20 mintTo
-                                                                       ▼
-                                                                  Erc20Minted
-                                                                       │
-                                                                       │ confirmDeposit
-                                                                       ▼
-                                                                    Settled
+```
+deposit:  QUOTED → KNOWN_DEPOSIT_TX → PROCESSING → ONECLICK_SUCCESS → POSITION_CREDITED
+redeem:   REQUESTED → SETTLED
 ```
 
-Failure transitions terminate in `Refunded` (relay-driven) or `Cancelled`
-(user-driven after the claim window).
+A background poller hits the 1Click bridge's `/v0/status` for active
+intents every `DARWIN_RELAY_V2_POLL_INTERVAL_S` seconds (default 10).
+Once an intent reaches `POSITION_CREDITED` it leaves the active set
+and is never credited twice.
 
-## Local dev
+The on-chain `atomic_deposit_note` submission against the basket
+controller is deferred to an off-process miden-client worker (the
+client's futures are `!Send` and would block axum's runtime).
+The relay's accounting tracks the position immediately and the worker
+reconciles `atomic_deposit_tx` + `miden_consume_tx` in place.
+
+## v2 — running it
 
 ```bash
-# ETH side
-forge test           # 25 tests
-forge build
-
-# Rust side
-cargo test           # 19 tests (state + bridge + store + service)
-cargo run --bin darwin_relay_service   # smoke: drives a sample deposit to Settled
+cargo build --release --bin darwin_relay_v2 --features v2
+./target/release/darwin_relay_v2
 ```
 
-## Status (2026-05-17)
+Configuration via env (all optional, defaults shown):
 
-- ETH escrow contract: scaffold complete, 25/25 Foundry tests green
-- Rust service: scaffold complete, 19/19 tests green
-- Bridge: MockBridge only — real AggLayer integration lands when the
-  canonical Miden ↔ Ethereum bridge is publicly live on testnet
-- Miden side: stub tx hashes in the FSM — real DepositNote submission
-  via miden-client lands as iteration 2 (gated behind the `miden-live`
-  feature)
-- ETH event watcher (alloy WS subscription on RelayDepositRequested):
-  iteration 2
+```bash
+DARWIN_RELAY_V2_BIND=0.0.0.0:8090
+DARWIN_RELAY_V2_STORE=./relay-v2.sqlite
+DARWIN_RELAY_V2_ONECLICK_URL=http://localhost:8080
+DARWIN_RELAY_V2_RELAY_WALLET_HEX=0xed3cd5befa3207805f8529207cfc0d
+DARWIN_RELAY_V2_CONTROLLER_HEX=0xa25aa0b00007688024b74b05a52aab
+DARWIN_RELAY_V2_POLL_INTERVAL_S=10
+```
+
+## End-to-end verification
+
+`scripts/oneclick_e2e.sh` walks the full deposit + redeem cycle
+against a local 1Click mock (Brian's `miden-testnet-bridge` Sepolia
+profile) and the v2 binary. It expects:
+
+- `darwin_relay_v2` running on `:8090`
+- A 1Click mock running on `:8080`
+- A funded Sepolia EOA exported as `DARWIN_DEV_KEY`
+- `cast` on `$PATH` (foundry)
+
+Run it with `bash scripts/oneclick_e2e.sh` once both services are up.
+
+## v1 — historical
+
+The v1 ETH-side escrow contract `DarwinRelayDeposit.sol` and the
+v1 binary `darwin_relay_service` are preserved for reference. See
+the git history before commit `e620dd6` for the v1 architecture
+notes that previously occupied this file.
 
 ## License
 
