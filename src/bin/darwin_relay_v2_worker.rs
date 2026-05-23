@@ -36,13 +36,15 @@ use miden_client::asset::{Asset, FungibleAsset};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::{
-    Note, NoteAssets, NoteMetadata, NoteRecipient, NoteScript, NoteStorage, NoteType,
+    Note, NoteAssets, NoteAttachment, NoteMetadata, NoteRecipient, NoteScript, NoteStorage,
+    NoteTag, NoteType,
 };
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_client_sqlite_store::SqliteStore;
 use miden_core_lib::CoreLibrary;
 use miden_protocol::transaction::TransactionKernel;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 
 // MASM sources vendored from darwin-protocol/crates/darwin-notes and
 // darwin-protocol-account. Kept in sync manually; both repos pin the
@@ -50,6 +52,7 @@ use rand::RngCore;
 const ATOMIC_DEPOSIT_NOTE_MASM: &str = include_str!("../../asm/atomic_deposit_note.masm");
 const ATOMIC_REDEEM_NOTE_MASM: &str = include_str!("../../asm/atomic_redeem_note.masm");
 const MATH_MASM: &str = include_str!("../../asm/lib/math.masm");
+const BRIDGE_OUT_V1_MASM: &str = include_str!("../../asm/bridge_out_v1.masm");
 
 const DEFAULT_RELAY_WALLET_HEX: &str = "0xed3cd5befa3207805f8529207cfc0d";
 const DEFAULT_CONTROLLER_HEX: &str = "0xa25aa0b00007688024b74b05a52aab";
@@ -62,6 +65,15 @@ const DEFAULT_CONTROLLER_HEX: &str = "0xa25aa0b00007688024b74b05a52aab";
 // the worker reads whichever fungible asset the relay holds — same
 // dynamic-discovery pattern as flow_c_full.
 const DEFAULT_DETH_FAUCET_HEX: &str = "0xa095d9b3831e96206ff70c2218a6a9";
+
+// 1Click bridge's miden-testnet:eth faucet — what the bridge mints
+// inbound and what it expects on outbound. The relay vault must hold
+// this faucet's tokens for the outbound P2ID leg to actually carry
+// usable assets. Configurable via env.
+const DEFAULT_ONECLICK_FAUCET_HEX: &str = "0x7aabde381e7ac6a06b22534a6900cb";
+const DEFAULT_ONECLICK_URL: &str = "http://localhost:8080";
+const ONECLICK_ORIGIN_ASSET: &str = "miden-testnet:eth";
+const ONECLICK_DEST_ASSET: &str = "eth-sepolia:eth";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -90,6 +102,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| DEFAULT_CONTROLLER_HEX.to_string());
     let faucet_hex = std::env::var("DARWIN_RELAY_V2_FAUCET_HEX")
         .unwrap_or_else(|_| DEFAULT_DETH_FAUCET_HEX.to_string());
+    let oneclick_faucet_hex = std::env::var("DARWIN_RELAY_V2_OUTBOUND_FAUCET_HEX")
+        .unwrap_or_else(|_| DEFAULT_ONECLICK_FAUCET_HEX.to_string());
+    let oneclick_url = std::env::var("DARWIN_RELAY_V2_ONECLICK_URL")
+        .unwrap_or_else(|_| DEFAULT_ONECLICK_URL.to_string());
     let poll_interval_s: u64 = std::env::var("DARWIN_RELAY_V2_WORKER_INTERVAL_S")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -98,6 +114,7 @@ async fn main() -> Result<()> {
     let relay_wallet = AccountId::from_hex(&relay_wallet_hex)?;
     let controller = AccountId::from_hex(&controller_hex)?;
     let deth_faucet = AccountId::from_hex(&faucet_hex)?;
+    let oneclick_faucet = AccountId::from_hex(&oneclick_faucet_hex)?;
 
     info!(
         %store_path,
@@ -105,9 +122,15 @@ async fn main() -> Result<()> {
         %relay_wallet_hex,
         %controller_hex,
         %faucet_hex,
+        %oneclick_faucet_hex,
+        %oneclick_url,
         poll_interval_s,
         "darwin-relay-v2 worker starting",
     );
+
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?;
 
     let store = SqliteStore::new(PathBuf::from(&miden_store)).await?;
     let mut client = ClientBuilder::<FilesystemKeyStore>::new()
@@ -141,6 +164,16 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("attach math_lib (redeem): {e}"))?
         .assemble_program(ATOMIC_REDEEM_NOTE_MASM)
         .map_err(|e| anyhow::anyhow!("assemble atomic_redeem_note.masm: {e}"))?;
+    // Bridge-out-v1 imports miden::standards::wallets::basic, which
+    // lives in the miden-standards crate (not the TransactionKernel
+    // stdlib path). Use the same CodeBuilder Brian's bridge uses on
+    // the mint side so the assembled script root matches byte-for-byte.
+    let bridge_out_script = miden_standards::code_builder::CodeBuilder::new()
+        .compile_note_script(miden_protocol::assembly::diagnostics::NamedSource::new(
+            "bridge::notes::bridge_out_v1",
+            BRIDGE_OUT_V1_MASM,
+        ))
+        .map_err(|e| anyhow::anyhow!("assemble bridge_out_v1.masm: {e}"))?;
     let deposit_script = NoteScript::new(deposit_program);
     let redeem_script = NoteScript::new(redeem_program);
 
@@ -151,8 +184,12 @@ async fn main() -> Result<()> {
             relay_wallet,
             controller,
             deth_faucet,
+            oneclick_faucet,
+            &oneclick_url,
+            &http,
             &deposit_script,
             &redeem_script,
+            &bridge_out_script,
         )
         .await
         {
@@ -162,17 +199,30 @@ async fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tick(
     client: &mut miden_client::Client<FilesystemKeyStore>,
     relay_store_path: &str,
     relay_wallet: AccountId,
     controller: AccountId,
     deth_faucet: AccountId,
+    oneclick_faucet: AccountId,
+    oneclick_url: &str,
+    http: &reqwest::Client,
     deposit_script: &NoteScript,
     redeem_script: &NoteScript,
+    bridge_out_script: &NoteScript,
 ) -> Result<()> {
     info!("syncing miden-client state…");
     client.sync_state().await.context("sync_state")?;
+
+    // Inbound notes (1Click deliveries) sit in COMMITTED state until
+    // someone runs a consume tx against them. Drain them first so the
+    // relay vault reflects the latest inflows before the other passes
+    // snapshot it.
+    if let Err(e) = drain_inbound_notes(client, relay_wallet).await {
+        warn!(error = %e, "drain_inbound_notes failed (continuing)");
+    }
 
     process_deposits(
         client,
@@ -193,6 +243,86 @@ async fn tick(
     )
     .await?;
 
+    process_outbound(
+        client,
+        relay_store_path,
+        relay_wallet,
+        oneclick_faucet,
+        oneclick_url,
+        http,
+        bridge_out_script,
+    )
+    .await?;
+
+    process_outbound_status(relay_store_path, oneclick_url, http).await?;
+
+    Ok(())
+}
+
+async fn drain_inbound_notes(
+    client: &mut miden_client::Client<FilesystemKeyStore>,
+    relay_wallet: AccountId,
+) -> Result<()> {
+    let consumable = client.get_consumable_notes(Some(relay_wallet)).await?;
+    if consumable.is_empty() {
+        return Ok(());
+    }
+    info!(count = consumable.len(), "candidate inbound notes");
+
+    // Consume notes one-by-one. The relay wallet's `consumable` set
+    // includes both real inbound P2IDs (1Click deliveries) and any
+    // darwin notes the relay itself emitted that happen to be
+    // self-relevant. Batching them in one tx makes the whole tx fail
+    // when any one fails (e.g. a note whose script call.<controller>
+    // can't run from the relay account). Per-note try-and-skip is
+    // slower but resilient.
+    let mut consumed = 0usize;
+    for (rec, _relevance) in consumable {
+        let note: Note = match TryInto::<Note>::try_into(rec) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(error = %e, "skip: not a consumable Note");
+                continue;
+            }
+        };
+        let note_id = note.id();
+        let req = match TransactionRequestBuilder::new().build_consume_notes(vec![note]) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(%note_id, error = %e, "skip: build_consume_notes failed");
+                continue;
+            }
+        };
+        let result = match client.execute_transaction(relay_wallet, req).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(%note_id, error = %e, "skip: execute failed");
+                continue;
+            }
+        };
+        let tx_id = result.executed_transaction().id();
+        let prover = client.prover();
+        let proven = match client.prove_transaction_with(&result, prover).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(%note_id, error = %e, "skip: prove failed");
+                continue;
+            }
+        };
+        let height = match client.submit_proven_transaction(proven, &result).await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(%note_id, error = %e, "skip: submit failed");
+                continue;
+            }
+        };
+        if let Err(e) = client.apply_transaction(&result, height).await {
+            warn!(%note_id, error = %e, "apply warning");
+        }
+        info!(%note_id, %tx_id, %height, "inbound note consumed");
+        consumed += 1;
+    }
+    info!(consumed, "drain pass complete");
     Ok(())
 }
 
@@ -549,6 +679,486 @@ async fn submit_atomic_redeem(
 }
 
 // ---------------------------------------------------------------------------
+// Outbound 1Click leg (Miden → Sepolia release for redemptions)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct OneClickQuoteReq<'a> {
+    dry: bool,
+    #[serde(rename = "depositMode")]
+    deposit_mode: &'a str,
+    #[serde(rename = "swapType")]
+    swap_type: &'a str,
+    #[serde(rename = "slippageTolerance")]
+    slippage_tolerance: f64,
+    #[serde(rename = "originAsset")]
+    origin_asset: &'a str,
+    #[serde(rename = "depositType")]
+    deposit_type: &'a str,
+    #[serde(rename = "destinationAsset")]
+    destination_asset: &'a str,
+    amount: String,
+    #[serde(rename = "refundTo")]
+    refund_to: String,
+    #[serde(rename = "refundType")]
+    refund_type: &'a str,
+    recipient: String,
+    #[serde(rename = "recipientType")]
+    recipient_type: &'a str,
+    deadline: &'a str,
+}
+
+#[derive(Deserialize, Debug)]
+struct OneClickQuoteResp {
+    #[serde(rename = "correlationId")]
+    correlation_id: String,
+    quote: OneClickQuote,
+}
+
+#[derive(Deserialize, Debug)]
+struct OneClickQuote {
+    #[serde(rename = "depositAddress")]
+    deposit_address: String,
+    #[serde(rename = "depositMemo", default)]
+    deposit_memo: Option<String>,
+    #[serde(rename = "amountOut")]
+    #[allow(dead_code)]
+    amount_out: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct BridgeOutMemo {
+    #[serde(rename = "bridgeAccountId")]
+    bridge_account_id: String,
+    storage: BridgeOutMemoStorage,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct BridgeOutMemoStorage {
+    storage_items: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct OneClickDepositSubmitReq<'a> {
+    #[serde(rename = "txHash")]
+    tx_hash: &'a str,
+    #[serde(rename = "depositAddress")]
+    deposit_address: &'a str,
+}
+
+#[derive(Deserialize, Debug)]
+struct OneClickStatusResp {
+    status: String,
+    #[serde(rename = "swapDetails", default)]
+    swap_details: Option<OneClickSwapDetails>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct OneClickSwapDetails {
+    #[serde(rename = "destinationChainTxHashes", default)]
+    destination_chain_tx_hashes: Vec<OneClickTxRef>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OneClickTxRef {
+    hash: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_outbound(
+    client: &mut miden_client::Client<FilesystemKeyStore>,
+    relay_store_path: &str,
+    relay_wallet: AccountId,
+    oneclick_faucet: AccountId,
+    oneclick_url: &str,
+    http: &reqwest::Client,
+    bridge_out_script: &NoteScript,
+) -> Result<()> {
+    let pending = load_outbound_pending(relay_store_path)?;
+    if pending.is_empty() {
+        info!("no outbound legs pending — idle");
+        return Ok(());
+    }
+    info!(count = pending.len(), "redemptions needing outbound bridge");
+
+    let relay_acct = client
+        .get_account(relay_wallet)
+        .await?
+        .with_context(|| format!("relay wallet {} not in store", relay_wallet.to_hex()))?;
+    let vault_balance = relay_acct.vault().get_balance(oneclick_faucet).unwrap_or(0);
+    info!(
+        relay_wallet = %relay_wallet.to_hex(),
+        oneclick_faucet = %oneclick_faucet.to_hex(),
+        balance = vault_balance,
+        "relay outbound vault snapshot",
+    );
+
+    for redemption in pending {
+        let basket_amount: u64 = match redemption.basket_amount.parse() {
+            Ok(a) => a,
+            Err(_) => {
+                warn!(
+                    redemption_id = %redemption.redemption_id,
+                    amount = %redemption.basket_amount,
+                    "amount doesn't fit in u64 — skipping",
+                );
+                continue;
+            }
+        };
+        // 99.7% net of 30 bps redeem fee, matching the on-chain note's
+        // gross_release_factor. M4 routes through Pragma + pro-rata.
+        let underlying = basket_amount.saturating_mul(9_970) / 10_000;
+
+        if vault_balance < underlying {
+            info!(
+                redemption_id = %redemption.redemption_id,
+                need = underlying,
+                have = vault_balance,
+                "outbound faucet under-funded — leaving for next tick",
+            );
+            continue;
+        }
+
+        // 1) Quote 1Click for Miden -> Sepolia.
+        let quote_req = OneClickQuoteReq {
+            dry: false,
+            deposit_mode: "SIMPLE",
+            swap_type: "EXACT_INPUT",
+            slippage_tolerance: 100.0,
+            origin_asset: ONECLICK_ORIGIN_ASSET,
+            deposit_type: "ORIGIN_CHAIN",
+            destination_asset: ONECLICK_DEST_ASSET,
+            amount: underlying.to_string(),
+            refund_to: relay_wallet.to_hex(),
+            refund_type: "ORIGIN_CHAIN",
+            recipient: redemption.user_evm_addr.clone(),
+            recipient_type: "DESTINATION_CHAIN",
+            deadline: "2027-01-01T00:00:00Z",
+        };
+        let url = format!("{}/v0/quote", oneclick_url.trim_end_matches('/'));
+        let resp = match http.post(&url).json(&quote_req).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                error!(redemption_id = %redemption.redemption_id, error = %e, "1Click quote http failed");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("1Click quote http: {e}"),
+                )?;
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            let code = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!(redemption_id = %redemption.redemption_id, %code, %body, "1Click quote non-2xx");
+            mark_redemption_error(
+                relay_store_path,
+                &redemption.redemption_id,
+                &format!("1Click quote {code}: {}", body.chars().take(200).collect::<String>()),
+            )?;
+            continue;
+        }
+        let quote: OneClickQuoteResp = match resp.json().await {
+            Ok(q) => q,
+            Err(e) => {
+                error!(redemption_id = %redemption.redemption_id, error = %e, "1Click quote decode failed");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("1Click quote decode: {e}"),
+                )?;
+                continue;
+            }
+        };
+        // The outbound P2ID is NOT a standard P2ID — Brian's bridge
+        // expects a bridge_out_v1 note carrying the quote's storage
+        // items so the bridge listener can correlate the inbound note
+        // with the original quote. Extract the encoded memo + storage
+        // items from the quote response.
+        let memo_str = match quote.quote.deposit_memo.as_deref() {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                error!(redemption_id = %redemption.redemption_id, "quote has no depositMemo");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    "1Click quote missing depositMemo",
+                )?;
+                continue;
+            }
+        };
+        let memo: BridgeOutMemo = match serde_json::from_str(memo_str) {
+            Ok(m) => m,
+            Err(e) => {
+                error!(redemption_id = %redemption.redemption_id, error = %e, "depositMemo decode failed");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("depositMemo decode: {e}"),
+                )?;
+                continue;
+            }
+        };
+        let bridge_account = match AccountId::from_hex(&memo.bridge_account_id) {
+            Ok(id) => id,
+            Err(e) => {
+                error!(redemption_id = %redemption.redemption_id, error = ?e, "bridge_account_id parse failed");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("bridge_account_id parse: {e:?}"),
+                )?;
+                continue;
+            }
+        };
+        let storage_felts: Vec<miden_client::Felt> = match memo
+            .storage
+            .storage_items
+            .iter()
+            .map(|s| s.parse::<u64>().map(miden_client::Felt::new))
+            .collect::<std::result::Result<_, _>>()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                error!(redemption_id = %redemption.redemption_id, error = %e, "storage_items parse failed");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("storage_items parse: {e}"),
+                )?;
+                continue;
+            }
+        };
+        info!(
+            redemption_id = %redemption.redemption_id,
+            correlation_id = %quote.correlation_id,
+            bridge_account = %memo.bridge_account_id,
+            storage_items = storage_felts.len(),
+            "1Click outbound quote (bridge_out_v1)",
+        );
+
+        // 2) Build the bridge_out_v1 note: same script + storage Brian
+        // mints on the quote side, NoteTag::with_account_target so the
+        // bridge listener picks it up.
+        let tag = NoteTag::with_account_target(bridge_account);
+        let metadata = NoteMetadata::new(relay_wallet, NoteType::Public)
+            .with_tag(tag)
+            .with_attachment(NoteAttachment::default());
+        let mut serial_bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut serial_bytes);
+        let serial_num = miden_client::Word::try_from(
+            serial_bytes
+                .chunks_exact(8)
+                .map(|chunk| {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(chunk);
+                    miden_client::Felt::new(u64::from_le_bytes(buf))
+                })
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )?;
+        let storage = NoteStorage::new(storage_felts)?;
+        let recipient = NoteRecipient::new(serial_num, bridge_out_script.clone(), storage);
+        let assets = NoteAssets::new(vec![Asset::Fungible(FungibleAsset::new(
+            oneclick_faucet,
+            underlying,
+        )?)])?;
+        let bridge_note = Note::new(assets, metadata, recipient);
+        let req = match TransactionRequestBuilder::new()
+            .own_output_notes(vec![bridge_note])
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!(redemption_id = %redemption.redemption_id, error = %e, "bridge-out build failed");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("bridge-out build: {e}"),
+                )?;
+                continue;
+            }
+        };
+        let tx_hex = match client.execute_transaction(relay_wallet, req).await {
+            Ok(result) => {
+                let id = result.executed_transaction().id();
+                let prover = client.prover();
+                let proven = match client.prove_transaction_with(&result, prover).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!(redemption_id = %redemption.redemption_id, error = %e, "outbound prove failed");
+                        mark_redemption_error(
+                            relay_store_path,
+                            &redemption.redemption_id,
+                            &format!("prove: {e}"),
+                        )?;
+                        continue;
+                    }
+                };
+                let height = match client.submit_proven_transaction(proven, &result).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!(redemption_id = %redemption.redemption_id, error = %e, "outbound submit failed");
+                        mark_redemption_error(
+                            relay_store_path,
+                            &redemption.redemption_id,
+                            &format!("submit: {e}"),
+                        )?;
+                        continue;
+                    }
+                };
+                if let Err(e) = client.apply_transaction(&result, height).await {
+                    warn!(redemption_id = %redemption.redemption_id, error = %e, "apply_transaction warning");
+                }
+                info!(
+                    redemption_id = %redemption.redemption_id,
+                    miden_bridge_out_tx = %id,
+                    height = %height,
+                    "outbound P2ID emitted",
+                );
+                format!("{id}")
+            }
+            Err(e) => {
+                error!(redemption_id = %redemption.redemption_id, error = %e, "outbound execute failed");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("execute: {e}"),
+                )?;
+                continue;
+            }
+        };
+
+        // 3) Notify 1Click that the inbound (from its POV) is in flight.
+        let submit_url = format!("{}/v0/deposit/submit", oneclick_url.trim_end_matches('/'));
+        let submit_body = OneClickDepositSubmitReq {
+            tx_hash: &tx_hex,
+            deposit_address: &quote.quote.deposit_address,
+        };
+        match http.post(&submit_url).json(&submit_body).send().await {
+            Ok(r) if r.status().is_success() => {
+                info!(redemption_id = %redemption.redemption_id, "1Click notified of outbound");
+            }
+            Ok(r) => {
+                let code = r.status();
+                warn!(
+                    redemption_id = %redemption.redemption_id,
+                    %code,
+                    "1Click deposit/submit non-2xx (continuing)"
+                );
+            }
+            Err(e) => {
+                warn!(redemption_id = %redemption.redemption_id, error = %e, "1Click deposit/submit http failed (continuing)");
+            }
+        }
+
+        // 4) Persist.
+        mark_redemption_outbound(
+            relay_store_path,
+            &redemption.redemption_id,
+            &tx_hex,
+            &quote.correlation_id,
+            &quote.quote.deposit_address,
+        )?;
+    }
+    Ok(())
+}
+
+async fn process_outbound_status(
+    relay_store_path: &str,
+    oneclick_url: &str,
+    http: &reqwest::Client,
+) -> Result<()> {
+    let pending = load_outbound_in_flight(relay_store_path)?;
+    if pending.is_empty() {
+        info!("no outbound legs in flight — idle");
+        return Ok(());
+    }
+    info!(count = pending.len(), "outbound legs in flight, polling 1Click");
+
+    for (rid, deposit_address) in pending {
+        let url = format!(
+            "{}/v0/status?depositAddress={}",
+            oneclick_url.trim_end_matches('/'),
+            urlencode(&deposit_address),
+        );
+        let resp = match http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(rid = %rid, error = %e, "1Click status http failed (continuing)");
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            warn!(rid = %rid, code = %resp.status(), "1Click status non-2xx");
+            continue;
+        }
+        let status: OneClickStatusResp = match resp.json().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(rid = %rid, error = %e, "1Click status decode failed");
+                continue;
+            }
+        };
+        info!(rid = %rid, status = %status.status, "1Click status");
+        match status.status.as_str() {
+            "SUCCESS" => {
+                if let Some(details) = status.swap_details {
+                    if let Some(release) = details.destination_chain_tx_hashes.first() {
+                        mark_redemption_settled(
+                            relay_store_path,
+                            &rid,
+                            &release.hash,
+                        )?;
+                        info!(rid = %rid, sepolia_release_tx = %release.hash, "outbound settled on Sepolia");
+                    } else {
+                        warn!(rid = %rid, "SUCCESS but no destinationChainTxHashes yet");
+                    }
+                }
+            }
+            "REFUNDED" | "FAILED" => {
+                mark_redemption_error(
+                    relay_store_path,
+                    &rid,
+                    &format!("1Click reported {}", status.status),
+                )?;
+            }
+            _ => { /* still PENDING/PROCESSING — leave for next tick */ }
+        }
+    }
+    Ok(())
+}
+
+fn parse_miden_account(s: &str) -> Result<AccountId> {
+    let trimmed = s.trim();
+    // Miden bech32 in some contexts (e.g. the relay tooling, the 1Click
+    // mock) is suffixed with `_qr7qqq9wr6w` — a separate group encoding
+    // the account-id-suffix that the bech32 part doesn't carry. The
+    // canonical AccountId::from_bech32 only accepts the underscore-less
+    // form, so strip the suffix before trying.
+    let canonical = trimmed.split_once('_').map(|(a, _)| a).unwrap_or(trimmed);
+    if canonical.starts_with("mtst1") || canonical.starts_with("mm1") {
+        let (_net, id) = AccountId::from_bech32(canonical)
+            .map_err(|e| anyhow::anyhow!("bech32 decode of {canonical:?}: {e}"))?;
+        Ok(id)
+    } else {
+        AccountId::from_hex(canonical).map_err(|e| anyhow::anyhow!("hex decode of {canonical:?}: {e}"))
+    }
+}
+
+fn urlencode(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            _ => format!("%{:02X}", c as u32),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // SQLite glue against the v2 service's store.
 // ---------------------------------------------------------------------------
 
@@ -692,6 +1302,103 @@ fn mark_redemption_error(
                   updated_at = ?3
               WHERE redemption_id = ?1"#,
         params![redemption_id, msg, now],
+    )?;
+    Ok(())
+}
+
+struct OutboundPending {
+    redemption_id: String,
+    user_evm_addr: String,
+    basket_amount: String,
+}
+
+fn load_outbound_pending(store_path: &str) -> Result<Vec<OutboundPending>> {
+    let conn = Connection::open(store_path)?;
+    let mut stmt = conn.prepare(
+        r#"SELECT redemption_id, user_evm_addr, basket_amount
+              FROM redemptions
+              WHERE miden_redeem_tx     IS NOT NULL
+                AND miden_bridge_out_tx IS NULL
+                AND (error IS NULL OR error = '')
+              ORDER BY created_at ASC"#,
+    )?;
+    let mut rows = stmt.query(params![])?;
+    let mut out = vec![];
+    while let Some(r) = rows.next()? {
+        out.push(OutboundPending {
+            redemption_id: r.get(0)?,
+            user_evm_addr: r.get(1)?,
+            basket_amount: r.get(2)?,
+        });
+    }
+    Ok(out)
+}
+
+fn mark_redemption_outbound(
+    store_path: &str,
+    redemption_id: &str,
+    tx_hex: &str,
+    correlation_id: &str,
+    deposit_address: &str,
+) -> Result<()> {
+    let conn = Connection::open(store_path)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    // oneclick_correlation stores BOTH the 1Click correlationId and
+    // the Miden deposit address it returned, joined by `|`. The status
+    // poller splits this back out — keeps the schema unchanged.
+    let joined = format!("{correlation_id}|{deposit_address}");
+    conn.execute(
+        r#"UPDATE redemptions
+              SET miden_bridge_out_tx  = ?2,
+                  oneclick_correlation = ?3,
+                  updated_at           = ?4
+              WHERE redemption_id = ?1"#,
+        params![redemption_id, tx_hex, joined, now],
+    )?;
+    Ok(())
+}
+
+fn load_outbound_in_flight(store_path: &str) -> Result<Vec<(String, String)>> {
+    let conn = Connection::open(store_path)?;
+    let mut stmt = conn.prepare(
+        r#"SELECT redemption_id, oneclick_correlation
+              FROM redemptions
+              WHERE miden_bridge_out_tx IS NOT NULL
+                AND sepolia_release_tx  IS NULL
+                AND oneclick_correlation IS NOT NULL
+                AND (error IS NULL OR error = '')
+              ORDER BY created_at ASC"#,
+    )?;
+    let mut rows = stmt.query(params![])?;
+    let mut out = vec![];
+    while let Some(r) = rows.next()? {
+        let id: String = r.get(0)?;
+        let joined: String = r.get(1)?;
+        if let Some((_corr, deposit)) = joined.split_once('|') {
+            out.push((id, deposit.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+fn mark_redemption_settled(
+    store_path: &str,
+    redemption_id: &str,
+    sepolia_release_tx: &str,
+) -> Result<()> {
+    let conn = Connection::open(store_path)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    conn.execute(
+        r#"UPDATE redemptions
+              SET sepolia_release_tx = ?2,
+                  stage              = 'FULLY_SETTLED',
+                  updated_at         = ?3
+              WHERE redemption_id = ?1"#,
+        params![redemption_id, sepolia_release_tx, now],
     )?;
     Ok(())
 }

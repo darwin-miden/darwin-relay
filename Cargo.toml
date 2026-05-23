@@ -68,6 +68,7 @@ v2-worker = [
     "dep:miden-assembly",
     "dep:miden-core-lib",
     "dep:miden-objects",
+    "dep:miden-standards",
     "dep:rand",
 ]
 
@@ -85,6 +86,10 @@ optional = true
 
 [dependencies.miden-objects]
 version  = "0.12"
+optional = true
+
+[dependencies.miden-standards]
+version  = "0.14"
 optional = true
 
 [dependencies.rand]
