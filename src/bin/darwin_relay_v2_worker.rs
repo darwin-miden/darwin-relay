@@ -48,6 +48,7 @@ use rand::RngCore;
 // darwin-protocol-account. Kept in sync manually; both repos pin the
 // same miden-assembly 0.22 / miden-protocol 0.14 ABI.
 const ATOMIC_DEPOSIT_NOTE_MASM: &str = include_str!("../../asm/atomic_deposit_note.masm");
+const ATOMIC_REDEEM_NOTE_MASM: &str = include_str!("../../asm/atomic_redeem_note.masm");
 const MATH_MASM: &str = include_str!("../../asm/lib/math.masm");
 
 const DEFAULT_RELAY_WALLET_HEX: &str = "0xed3cd5befa3207805f8529207cfc0d";
@@ -116,8 +117,10 @@ async fn main() -> Result<()> {
         .build()
         .await?;
 
-    // Build the NoteScript once — same assembly the protocol crate
-    // uses, vendored locally.
+    // Build the two NoteScripts once — atomic_deposit (for the inbound
+    // leg) and atomic_redeem (for the outbound leg). Both link the
+    // shared darwin::math library exactly like the protocol crate's
+    // flow_a / flow_c do.
     let core_lib = CoreLibrary::default();
     let sm: Arc<dyn miden_assembly::SourceManager> = Arc::new(DefaultSourceManager::default());
     let math_module = Module::parser(ModuleKind::Library)
@@ -128,12 +131,18 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("attach core_lib: {e}"))?
         .assemble_library([math_module])
         .map_err(|e| anyhow::anyhow!("assemble math.masm: {e}"))?;
-    let program = TransactionKernel::assembler()
+    let deposit_program = TransactionKernel::assembler()
         .with_static_library(math_lib.as_ref())
-        .map_err(|e| anyhow::anyhow!("attach math_lib: {e}"))?
+        .map_err(|e| anyhow::anyhow!("attach math_lib (deposit): {e}"))?
         .assemble_program(ATOMIC_DEPOSIT_NOTE_MASM)
         .map_err(|e| anyhow::anyhow!("assemble atomic_deposit_note.masm: {e}"))?;
-    let note_script = NoteScript::new(program);
+    let redeem_program = TransactionKernel::assembler()
+        .with_static_library(math_lib.as_ref())
+        .map_err(|e| anyhow::anyhow!("attach math_lib (redeem): {e}"))?
+        .assemble_program(ATOMIC_REDEEM_NOTE_MASM)
+        .map_err(|e| anyhow::anyhow!("assemble atomic_redeem_note.masm: {e}"))?;
+    let deposit_script = NoteScript::new(deposit_program);
+    let redeem_script = NoteScript::new(redeem_program);
 
     loop {
         if let Err(e) = tick(
@@ -142,7 +151,8 @@ async fn main() -> Result<()> {
             relay_wallet,
             controller,
             deth_faucet,
-            &note_script,
+            &deposit_script,
+            &redeem_script,
         )
         .await
         {
@@ -158,11 +168,42 @@ async fn tick(
     relay_wallet: AccountId,
     controller: AccountId,
     deth_faucet: AccountId,
-    note_script: &NoteScript,
+    deposit_script: &NoteScript,
+    redeem_script: &NoteScript,
 ) -> Result<()> {
     info!("syncing miden-client state…");
     client.sync_state().await.context("sync_state")?;
 
+    process_deposits(
+        client,
+        relay_store_path,
+        relay_wallet,
+        controller,
+        deth_faucet,
+        deposit_script,
+    )
+    .await?;
+
+    process_redemptions(
+        client,
+        relay_store_path,
+        relay_wallet,
+        controller,
+        redeem_script,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn process_deposits(
+    client: &mut miden_client::Client<FilesystemKeyStore>,
+    relay_store_path: &str,
+    relay_wallet: AccountId,
+    controller: AccountId,
+    deth_faucet: AccountId,
+    note_script: &NoteScript,
+) -> Result<()> {
     let pending = load_pending_intents(relay_store_path)?;
     if pending.is_empty() {
         info!("no pending intents — idle");
@@ -256,6 +297,121 @@ async fn tick(
     Ok(())
 }
 
+async fn process_redemptions(
+    client: &mut miden_client::Client<FilesystemKeyStore>,
+    relay_store_path: &str,
+    relay_wallet: AccountId,
+    controller: AccountId,
+    note_script: &NoteScript,
+) -> Result<()> {
+    let pending = load_pending_redemptions(relay_store_path)?;
+    if pending.is_empty() {
+        info!("no pending redemptions — idle");
+        return Ok(());
+    }
+    info!(count = pending.len(), "redemptions needing on-chain submission");
+
+    let relay_acct = client
+        .get_account(relay_wallet)
+        .await?
+        .with_context(|| format!("relay wallet {} not in store", relay_wallet.to_hex()))?;
+
+    for redemption in pending {
+        let amount = match redemption.basket_amount.parse::<u64>() {
+            Ok(a) => a,
+            Err(_) => {
+                warn!(
+                    redemption_id = %redemption.redemption_id,
+                    amount = %redemption.basket_amount,
+                    "amount doesn't fit in u64 — skipping",
+                );
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    "amount overflows u64",
+                )?;
+                continue;
+            }
+        };
+
+        // The basket-token faucet is symbol-derived in M4; for the M3
+        // demo we discover it the same way flow_c_full does — pick a
+        // fungible asset from the relay vault with balance >= amount.
+        // The atomic redeem note is faucet-agnostic, the controller
+        // accepts whatever vault key the note carries.
+        let basket_faucet = match pick_basket_faucet(&relay_acct, amount) {
+            Some(id) => id,
+            None => {
+                info!(
+                    redemption_id = %redemption.redemption_id,
+                    need = amount,
+                    "no relay vault asset with sufficient balance — leaving for next tick",
+                );
+                continue;
+            }
+        };
+
+        match submit_atomic_redeem(
+            client,
+            relay_wallet,
+            controller,
+            basket_faucet,
+            amount,
+            note_script,
+            &redemption,
+        )
+        .await
+        {
+            Ok((tx_hex, note_hex)) => {
+                info!(
+                    redemption_id = %redemption.redemption_id,
+                    miden_redeem_tx = %tx_hex,
+                    note_id = %note_hex,
+                    "atomic_redeem_note submitted",
+                );
+                mark_redemption_submitted(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &tx_hex,
+                    &note_hex,
+                )?;
+            }
+            Err(e) => {
+                error!(
+                    redemption_id = %redemption.redemption_id,
+                    error = %e,
+                    "atomic_redeem submission failed",
+                );
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("submission failed: {e}"),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pick_basket_faucet(
+    relay_acct: &miden_client::account::Account,
+    min_amount: u64,
+) -> Option<AccountId> {
+    let mut candidates: Vec<(AccountId, u64)> = relay_acct
+        .vault()
+        .assets()
+        .filter_map(|a| match a {
+            Asset::Fungible(fa) => Some((fa.faucet_id(), fa.amount())),
+            Asset::NonFungible(_) => None,
+        })
+        .filter(|(_, amt)| *amt >= min_amount)
+        .collect();
+    // Prefer the smallest sufficient balance so we don't drain a
+    // large position to redeem a small one.
+    candidates.sort_by_key(|(_, amt)| *amt);
+    candidates.into_iter().next().map(|(id, _)| id)
+}
+
 async fn submit_atomic_deposit(
     client: &mut miden_client::Client<FilesystemKeyStore>,
     relay_wallet: AccountId,
@@ -324,6 +480,74 @@ async fn submit_atomic_deposit(
     Ok((format!("{tx_id}"), format!("{note_id}")))
 }
 
+async fn submit_atomic_redeem(
+    client: &mut miden_client::Client<FilesystemKeyStore>,
+    relay_wallet: AccountId,
+    controller: AccountId,
+    basket_faucet: AccountId,
+    amount: u64,
+    note_script: &NoteScript,
+    redemption: &PendingRedemption,
+) -> Result<(String, String)> {
+    let assets = NoteAssets::new(vec![Asset::Fungible(FungibleAsset::new(
+        basket_faucet,
+        amount,
+    )?)])?;
+    // The note's `call.<receive_asset_root>` lands the basket-tokens
+    // into the controller's vault. Controller is referenced only via
+    // the burned MAST root inside the note script — sender metadata
+    // stays the relay wallet so the basket-tokens originate from there.
+    let _ = controller;
+    let metadata = NoteMetadata::new(relay_wallet, NoteType::Public);
+
+    let mut serial_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut serial_bytes);
+    let serial_num = miden_client::Word::try_from(
+        serial_bytes
+            .chunks_exact(8)
+            .map(|chunk| {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(chunk);
+                miden_client::Felt::new(u64::from_le_bytes(buf))
+            })
+            .collect::<Vec<_>>()
+            .as_slice(),
+    )?;
+
+    // Storage felts per atomic_redeem_note.masm:
+    //   [burn_amount, gross_release_factor, scale]
+    // Same shape as flow_c_full: 9970 = 99.7% net of 30 bps redeem fee.
+    let storage_felts = vec![
+        miden_client::Felt::new(amount),
+        miden_client::Felt::new(9_970),
+        miden_client::Felt::new(1),
+    ];
+    let recipient = NoteRecipient::new(
+        serial_num,
+        note_script.clone(),
+        NoteStorage::new(storage_felts)?,
+    );
+    let note = Note::new(assets, metadata, recipient);
+    let note_id = note.id();
+
+    let req = TransactionRequestBuilder::new()
+        .own_output_notes(vec![note.clone()])
+        .build()?;
+    let result = client.execute_transaction(relay_wallet, req).await?;
+    let tx_id = result.executed_transaction().id();
+    let prover = client.prover();
+    let proven = client.prove_transaction_with(&result, prover).await?;
+    let height = client.submit_proven_transaction(proven, &result).await?;
+    client.apply_transaction(&result, height).await?;
+
+    info!(
+        redemption_id = %redemption.redemption_id,
+        height = %height,
+        "atomic_redeem tx confirmed",
+    );
+    Ok((format!("{tx_id}"), format!("{note_id}")))
+}
+
 // ---------------------------------------------------------------------------
 // SQLite glue against the v2 service's store.
 // ---------------------------------------------------------------------------
@@ -333,6 +557,15 @@ struct PendingIntent {
     user_evm_addr: String,
     basket_symbol: String,
     amount_in_wei: String,
+}
+
+struct PendingRedemption {
+    redemption_id: String,
+    #[allow(dead_code)]
+    user_evm_addr: String,
+    #[allow(dead_code)]
+    basket_symbol: String,
+    basket_amount: String,
 }
 
 fn load_pending_intents(store_path: &str) -> Result<Vec<PendingIntent>> {
@@ -393,6 +626,72 @@ fn mark_intent_error(
                   updated_at = ?3
               WHERE correlation_id = ?1"#,
         params![correlation_id, msg, now],
+    )?;
+    Ok(())
+}
+
+fn load_pending_redemptions(store_path: &str) -> Result<Vec<PendingRedemption>> {
+    let conn = Connection::open(store_path)?;
+    let mut stmt = conn.prepare(
+        r#"SELECT redemption_id, user_evm_addr, basket_symbol, basket_amount
+              FROM redemptions
+              WHERE miden_redeem_tx IS NULL
+                AND (error IS NULL OR error = '')
+              ORDER BY created_at ASC"#,
+    )?;
+    let mut rows = stmt.query(params![])?;
+    let mut out = vec![];
+    while let Some(r) = rows.next()? {
+        out.push(PendingRedemption {
+            redemption_id: r.get(0)?,
+            user_evm_addr: r.get(1)?,
+            basket_symbol: r.get(2)?,
+            basket_amount: r.get(3)?,
+        });
+    }
+    Ok(out)
+}
+
+fn mark_redemption_submitted(
+    store_path: &str,
+    redemption_id: &str,
+    tx_hex: &str,
+    note_hex: &str,
+) -> Result<()> {
+    let conn = Connection::open(store_path)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    // miden_redeem_tx = the burn-leg tx hash. miden_bridge_out_tx is
+    // left null on purpose — it gets set by the outbound 1Click worker
+    // once the controller has released underlyings back to the relay
+    // vault and the bridge-out note has been emitted (M4 work).
+    let _ = note_hex;
+    conn.execute(
+        r#"UPDATE redemptions
+              SET miden_redeem_tx = ?2,
+                  updated_at      = ?3
+              WHERE redemption_id = ?1"#,
+        params![redemption_id, tx_hex, now],
+    )?;
+    Ok(())
+}
+
+fn mark_redemption_error(
+    store_path: &str,
+    redemption_id: &str,
+    msg: &str,
+) -> Result<()> {
+    let conn = Connection::open(store_path)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    conn.execute(
+        r#"UPDATE redemptions
+              SET error      = ?2,
+                  updated_at = ?3
+              WHERE redemption_id = ?1"#,
+        params![redemption_id, msg, now],
     )?;
     Ok(())
 }

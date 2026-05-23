@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS redemptions (
     basket_amount         TEXT NOT NULL,
     stage                 TEXT NOT NULL,
     oneclick_correlation  TEXT,
+    miden_redeem_tx       TEXT,
     miden_bridge_out_tx   TEXT,
     sepolia_release_tx    TEXT,
     error                 TEXT,
@@ -108,6 +109,13 @@ CREATE TABLE IF NOT EXISTS redemptions (
     updated_at            INTEGER NOT NULL
 );
 "#;
+
+// SQLite has no `ADD COLUMN IF NOT EXISTS`; replay these and ignore
+// "duplicate column name" errors so the migration is idempotent on
+// existing databases.
+const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE redemptions ADD COLUMN miden_redeem_tx TEXT",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct Intent {
@@ -792,6 +800,17 @@ async fn main() -> Result<()> {
 
     let conn = Connection::open(&store_path).context("open sqlite")?;
     conn.execute_batch(SCHEMA).context("init schema")?;
+    for stmt in MIGRATIONS {
+        if let Err(e) = conn.execute(stmt, []) {
+            // SQLite signals already-applied ADD COLUMN with "duplicate
+            // column name"; treat that as a no-op so existing dbs
+            // don't blow up on restart.
+            if e.to_string().contains("duplicate column name") {
+                continue;
+            }
+            return Err(e).with_context(|| format!("migration: {stmt}"));
+        }
+    }
 
     let cfg = AppConfig {
         relay_miden_address,

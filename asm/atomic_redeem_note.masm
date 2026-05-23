@@ -1,0 +1,87 @@
+# Atomic RedeemNote — Flow C Path 2 in one note, kernel-aware.
+#
+# Spec: darwin-docs/m1-architecture-spec.md §6.5 + §7.2.
+#
+# Consumed by a Darwin Protocol Account that exposes `receive_asset`
+# (mirror of `miden::standards::wallets::basic::receive_asset`). The
+# note does three things on-chain:
+#
+#   1. Compute `release_value = burn_amount * gross_release_factor`
+#      via `darwin::math::felt_div`. Production caller pre-computes
+#      `gross_release_factor = (10000 - redeem_fee_bps) * nav / 10000`.
+#      For the demo we hard-code constants.
+#
+#   2. Walk the note's vault (basket tokens the user attached) and
+#      hand them over to the controller via `call.receive_asset` — the
+#      assets land in the controller's vault, which is the on-chain
+#      effect of "burning" the user's basket tokens (they leave
+#      circulation; M2 chains in a basket-faucet `burn` call to
+#      reduce supply explicitly).
+#
+#   3. Return at stack depth 16 (kernel requirement).
+#
+# Symmetric pair of `atomic_deposit_note.masm`. Together they
+# demonstrate Flow A Path 2 (deposit) + Flow C Path 2 (redeem) on
+# Miden testnet — both Miden-native paths, independent of AggLayer.
+
+use darwin::math
+use miden::protocol::active_note
+use miden::protocol::asset::ASSET_VALUE_MEMORY_OFFSET
+use miden::protocol::asset::ASSET_SIZE
+
+# v2 real-bodies controller `receive_asset` MAST root. The note
+# `call.X`s into it once per attached basket-token asset so the
+# kernel's asset-conservation invariant is satisfied.
+#
+# `call.0x75f638c65584d058542bcf4674b066ae394183021bc9b44dc2fdd97d52f9bcfb`
+
+# --------------------------------------------------------------------------------
+# `drain_assets_into_controller` — same basic-wallet-style loop as the deposit
+# note. The note's vault holds basket tokens (DCC / DAG / DCO) that the user
+# wants to burn; each iteration hands them to the controller.
+# --------------------------------------------------------------------------------
+@locals(2048)
+proc drain_assets_into_controller
+    locaddr.0 exec.active_note::get_assets
+    mul.ASSET_SIZE dup.1 add
+    padw padw movup.9
+    dup dup.10 neq
+    while.true
+        dup movdn.9
+        add.ASSET_VALUE_MEMORY_OFFSET mem_loadw_le swapw
+        dup.8 mem_loadw_le
+        padw padw swapdw
+        call.0x75f638c65584d058542bcf4674b066ae394183021bc9b44dc2fdd97d52f9bcfb
+        dropw dropw
+        movup.8 add.ASSET_SIZE dup
+        dup.10 neq
+    end
+    drop dropw dropw drop
+end
+
+# --------------------------------------------------------------------------------
+# `compute_release_amount_from_storage` — symmetric to the deposit note. Storage
+# layout:
+#   storage[0] = burn_amount
+#   storage[1] = gross_release_factor (10000 - redeem_fee_bps)
+#   storage[2] = scale (denominator)
+# release_value = burn_amount * gross_release_factor / scale, computed via
+# darwin::math::felt_div for u64-safe division.
+# --------------------------------------------------------------------------------
+proc compute_release_amount_from_storage
+    push.100                          # dest_ptr
+    exec.active_note::get_storage     # writes storage to memory
+    drop drop                          # discard [num_items, dest_ptr]
+
+    push.100 mem_load                 # burn_amount
+    push.101 mem_load                 # gross_release_factor
+    push.102 mem_load                 # scale
+    mul                                # gross_release_factor * scale
+    exec.math::felt_div                # ... / burn_amount
+    drop
+end
+
+begin
+    exec.compute_release_amount_from_storage
+    exec.drain_assets_into_controller
+end
