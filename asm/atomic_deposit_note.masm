@@ -1,0 +1,84 @@
+# Atomic DepositNote — Flow A in one note, kernel-aware version.
+#
+# Spec: darwin-docs/m1-architecture-spec.md §7.1.
+#
+# Consumed by a Darwin Protocol Account that exposes `receive_asset`
+# (mirror of `miden::standards::wallets::basic::receive_asset`). The
+# note does three things on-chain:
+#
+#   1. Compute `mint_amount = deposit_value * fee_factor / nav` via
+#      `darwin::math::felt_div` (real u64 division through
+#      `miden::core::math::u64::div`). Demo inputs are hard-coded
+#      until the SDK wires note inputs through the advice provider.
+#
+#   2. Walk every asset in the note's vault using
+#      `miden::protocol::active_note::get_assets` and call into the
+#      consuming account's `receive_asset` procedure for each. This
+#      satisfies the kernel's asset-conservation invariant: assets
+#      leave the note and end up in the controller's vault.
+#
+#   3. Return at stack depth 16 (kernel requirement).
+
+use darwin::math
+use miden::protocol::active_note
+use miden::protocol::asset::ASSET_VALUE_MEMORY_OFFSET
+use miden::protocol::asset::ASSET_SIZE
+
+# MAST root of the v2 real-bodies controller's `receive_asset`. The
+# controller exposes this proc; the note `call.X`s into it once per
+# deposited asset. The hex must be inlined at the call site because
+# the assembler doesn't substitute constants into `call.X`.
+#
+# `call.0x75f638c65584d058542bcf4674b066ae394183021bc9b44dc2fdd97d52f9bcfb`
+
+# --------------------------------------------------------------------------------
+# `drain_assets_into_controller` — basic-wallet-style asset-loop, adapted to call
+# the controller's receive_asset MAST root rather than basic-wallet's own copy.
+# --------------------------------------------------------------------------------
+@locals(2048)
+proc drain_assets_into_controller
+    locaddr.0 exec.active_note::get_assets
+    mul.ASSET_SIZE dup.1 add
+    padw padw movup.9
+    dup dup.10 neq
+    while.true
+        dup movdn.9
+        add.ASSET_VALUE_MEMORY_OFFSET mem_loadw_le swapw
+        dup.8 mem_loadw_le
+        padw padw swapdw
+        call.0x75f638c65584d058542bcf4674b066ae394183021bc9b44dc2fdd97d52f9bcfb
+        dropw dropw
+        movup.8 add.ASSET_SIZE dup
+        dup.10 neq
+    end
+    drop dropw dropw drop
+end
+
+# --------------------------------------------------------------------------------
+# `compute_mint_amount_from_storage` — same math as the demo proc, but the three
+# operands come from the note's storage (set by the caller when the note is
+# constructed). Layout, in order:
+#   storage[0] = deposit_value
+#   storage[1] = fee_factor
+#   storage[2] = nav_scale
+# `active_note::get_storage` writes them to memory[dest_ptr..dest_ptr+3] as
+# individual felts (it pads/round-trips via pipe_double_words_to_memory internally
+# but each storage item still lands at a single felt address).
+# --------------------------------------------------------------------------------
+proc compute_mint_amount_from_storage
+    push.100                          # dest_ptr
+    exec.active_note::get_storage     # writes storage to memory
+    drop drop                          # discard [num_items, dest_ptr]
+
+    push.100 mem_load                 # deposit_value
+    push.101 mem_load                 # fee_factor
+    push.102 mem_load                 # nav_scale
+    mul
+    exec.math::felt_div
+    drop
+end
+
+begin
+    exec.compute_mint_amount_from_storage
+    exec.drain_assets_into_controller
+end

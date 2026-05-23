@@ -58,9 +58,37 @@ v2 = [
     "dep:uuid",
     "dep:reqwest",
 ]
+# Worker that drives the on-chain atomic_deposit_note submission for
+# v2-credited intents. Brings in the full miden-client + assembler
+# stack — heaviest feature, separate so the lighter v2 binary stays
+# quick to build.
+v2-worker = [
+    "v2",
+    "miden-live",
+    "dep:miden-assembly",
+    "dep:miden-core-lib",
+    "dep:miden-objects",
+    "dep:rand",
+]
 
 [dependencies.miden-tx]
 version  = "0.14"
+optional = true
+
+[dependencies.miden-assembly]
+version  = "0.22"
+optional = true
+
+[dependencies.miden-core-lib]
+version  = "0.22"
+optional = true
+
+[dependencies.miden-objects]
+version  = "0.12"
+optional = true
+
+[dependencies.rand]
+version  = "0.8"
 optional = true
 
 [dependencies.axum]
@@ -86,6 +114,11 @@ path = "src/bin/darwin_relay_service.rs"
 name              = "darwin_relay_v2"
 path              = "src/bin/darwin_relay_v2.rs"
 required-features = ["v2"]
+
+[[bin]]
+name              = "darwin_relay_v2_worker"
+path              = "src/bin/darwin_relay_v2_worker.rs"
+required-features = ["v2-worker"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

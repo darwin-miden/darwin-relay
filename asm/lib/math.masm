@@ -1,0 +1,42 @@
+# Felt-scale math helpers used by the Darwin Protocol Account.
+#
+# Spec: darwin-docs/m1-architecture-spec.md §6.2 (NAV precision).
+#
+# The other library modules (mint, fees, redeem, nav, flow) use
+# `u32div` for their final integer division. That op requires both
+# operands to fit in u32, which is restrictive for real on-chain
+# values. This module provides `felt_div`, a u64-safe division that
+# wraps the std-lib `miden::core::math::u64::div` procedure.
+#
+# `felt_div` accepts any two felt values whose magnitudes fit in u64
+# (the Goldilocks felt comfortably represents anything up to
+# ~1.84e19), splits each into a (lo, hi) u32 pair, calls the std-lib
+# divider, and recombines the (lo, hi) result back into a felt. The
+# round-trip is exact when both operands and the quotient fit in u64.
+
+use miden::core::math::u64
+
+const TWO_POW_32 = 4294967296
+
+#! Computes `num / div` as integer division, with both inputs and the
+#! quotient treated as u64 values represented as felts.
+#!
+#! Stack on entry:   [num, div]
+#! Stack on exit:    [num / div]
+#!
+#! The numerator and divisor must each fit in u64 (i.e. their felt
+#! values must be < 2^64). Within Darwin's spec scales (USD * 1e8,
+#! basket-token base units at 8 decimals, etc.) this constraint is
+#! comfortably satisfied for any plausible TVL.
+pub proc felt_div
+    # Stack: [num, div]
+    u32split             # [num_lo, num_hi, div]
+    movup.2              # [div, num_lo, num_hi]
+    u32split             # [div_lo, div_hi, num_lo, num_hi]
+    exec.u64::div        # [result_lo, result_hi]
+    # Recombine: result = result_lo + result_hi * 2^32
+    swap                 # [result_hi, result_lo]
+    push.TWO_POW_32      # [2^32, result_hi, result_lo]
+    mul                  # [result_hi * 2^32, result_lo]
+    add                  # [result]
+end
