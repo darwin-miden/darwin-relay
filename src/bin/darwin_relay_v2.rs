@@ -586,6 +586,44 @@ async fn get_redemption(
     }
 }
 
+async fn list_redemptions_for_user(
+    State(state): State<Arc<AppState>>,
+    Path(user_evm_addr): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let user_lower = user_evm_addr.to_lowercase();
+    let db = state.db.lock().await;
+    let mut stmt = db
+        .prepare(
+            r#"SELECT redemption_id, user_evm_addr, basket_symbol, basket_amount, stage,
+                      oneclick_correlation, miden_redeem_tx, miden_bridge_out_tx,
+                      sepolia_release_tx, error, created_at, updated_at
+                  FROM redemptions
+                  WHERE user_evm_addr = ?1
+                  ORDER BY created_at DESC
+                  LIMIT 50"#,
+        )
+        .map_err(internal_err)?;
+    let mut rows = stmt.query(params![user_lower]).map_err(internal_err)?;
+    let mut out: Vec<Value> = Vec::new();
+    while let Some(r) = rows.next().map_err(internal_err)? {
+        out.push(json!({
+            "redemption_id":         r.get::<_, String>(0).map_err(internal_err)?,
+            "user_evm_addr":         r.get::<_, String>(1).map_err(internal_err)?,
+            "basket_symbol":         r.get::<_, String>(2).map_err(internal_err)?,
+            "basket_amount":         r.get::<_, String>(3).map_err(internal_err)?,
+            "stage":                 r.get::<_, String>(4).map_err(internal_err)?,
+            "oneclick_correlation":  r.get::<_, Option<String>>(5).map_err(internal_err)?,
+            "miden_redeem_tx":       r.get::<_, Option<String>>(6).map_err(internal_err)?,
+            "miden_bridge_out_tx":   r.get::<_, Option<String>>(7).map_err(internal_err)?,
+            "sepolia_release_tx":    r.get::<_, Option<String>>(8).map_err(internal_err)?,
+            "error":                 r.get::<_, Option<String>>(9).map_err(internal_err)?,
+            "created_at":            r.get::<_, i64>(10).map_err(internal_err)?,
+            "updated_at":            r.get::<_, i64>(11).map_err(internal_err)?,
+        }));
+    }
+    Ok(Json(json!({ "user": user_lower, "redemptions": out })))
+}
+
 async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "service": "darwin-relay-v2" }))
 }
@@ -834,6 +872,7 @@ async fn main() -> Result<()> {
         .route("/v0/intents/:correlation_id/deposit", post(attach_deposit))
         .route("/v0/redeem", post(redeem))
         .route("/v0/redeem/:redemption_id", get(get_redemption))
+        .route("/v0/redemptions/:user_evm_addr", get(list_redemptions_for_user))
         .route("/v0/positions/:user_evm_addr", get(get_positions))
         .with_state(state);
 
