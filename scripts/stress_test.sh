@@ -117,11 +117,15 @@ case "$SCENARIO" in
     done
     ;;
   scale)
-    # Fire N (default 100) deposits with a parallelism cap. The cap
-    # exists because Sepolia public RPCs (publicnode in particular)
-    # rate-limit aggressively past ~12 in-flight `cast send` calls
-    # from one EOA — without the cap we'd just measure 429s, not the
-    # relay's actual throughput.
+    # Fire N (default 100) deposits with parallel submitters. The
+    # key trick is to **pre-assign nonces**: parallel `cast send`
+    # from one EOA all auto-fetch the same nonce from the chain
+    # (cast doesn't synchronise across processes), so without
+    # explicit `--nonce N+idx` 9 of 10 in-flight submissions die
+    # with "nonce too low" the moment the first one lands. With
+    # pinned consecutive nonces the chain orders them, and we get
+    # actual parallel throughput rather than measuring nonce
+    # collisions.
     N=${SCALE_N:-100}
     P=${SCALE_PARALLELISM:-10}
     ids=("$DCC_ID" "$DAG_ID" "$DCO_ID")
@@ -136,34 +140,44 @@ case "$SCENARIO" in
     cast send "$USDC" "approve(address,uint256)" "$RELAY" "$total" \
       --rpc-url "$RPC" --private-key "$USER_PK" --json >/dev/null 2>&1
 
+    # Snapshot the starting nonce AFTER the approve has been mined
+    # so we begin from the first free slot.
+    sleep 2
+    START_NONCE=$(cast nonce "$USER" --rpc-url "$RPC")
+    echo "[scale] starting nonce = $START_NONCE"
+
     submit_scale_one() {
       local idx=$1
       local basket="${ids[$((idx % 3))]}"
       local amount="${amounts[$((idx % 5))]}"
-      local t0 t1 hash
+      local nonce=$(( START_NONCE + idx ))
+      local t0 t1 hash err
       t0=$(date +%s)
+      err=$(mktemp)
       hash=$(cast send "$RELAY" "deposit(uint256,bytes32,bytes32)" \
         "$amount" "$basket" "$MIDEN_RECIPIENT" \
-        --rpc-url "$RPC" --private-key "$USER_PK" --json 2>/dev/null \
+        --rpc-url "$RPC" --private-key "$USER_PK" \
+        --nonce "$nonce" --json 2>"$err" \
         | jq -r .transactionHash 2>/dev/null)
       t1=$(date +%s)
       if [[ -n "$hash" && "$hash" != "null" ]]; then
-        echo -e "$idx\t$basket\t$amount\t$hash\t-\t$((t1 - t0))" >> "$results"
-        echo "[scale $idx] tx=$hash submit=$((t1 - t0))s"
+        echo -e "$idx\t$basket\t$amount\t$hash\t-\t$((t1 - t0))\t$nonce" >> "$results"
+        echo "[scale $idx] tx=$hash nonce=$nonce submit=$((t1 - t0))s"
       else
-        echo -e "$idx\t$basket\t$amount\tFAIL\t-\t$((t1 - t0))" >> "$results"
-        echo "[scale $idx] FAIL"
+        local msg="$(tr '\n' ' ' < "$err" | head -c 120)"
+        echo -e "$idx\t$basket\t$amount\tFAIL\t-\t$((t1 - t0))\t$nonce" >> "$results"
+        echo "[scale $idx] FAIL nonce=$nonce err=${msg}"
       fi
+      rm -f "$err"
     }
 
-    echo -e "idx\tbasket\tamount_usdc_base\trequest_tx\trequest_block\tsubmit_seconds" > "$results"
+    echo -e "idx\tbasket\tamount_usdc_base\trequest_tx\trequest_block\tsubmit_seconds\tnonce" > "$results"
 
     start_wall=$(date +%s)
     pids=()
     for i in $(seq 0 $((N - 1))); do
       submit_scale_one "$i" &
       pids+=("$!")
-      # Throttle to P concurrent submitters.
       if (( ${#pids[@]} >= P )); then
         wait "${pids[0]}" 2>/dev/null
         pids=("${pids[@]:1}")
@@ -173,7 +187,7 @@ case "$SCENARIO" in
     end_wall=$(date +%s)
 
     ok=$(grep -c -v 'FAIL' "$results" || true)
-    ok=$(( ok - 1 ))   # minus header
+    ok=$(( ok - 1 ))
     fail=$(grep -c 'FAIL' "$results" || true)
     echo
     echo "[scale] wall=$((end_wall - start_wall))s ok=$ok fail=$fail (N=$N, P=$P)"
