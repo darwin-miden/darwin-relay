@@ -57,12 +57,12 @@ const MATH_MASM: &str = include_str!("../../asm/lib/math.masm");
 const BRIDGE_OUT_V1_MASM: &str = include_str!("../../asm/bridge_out_v1.masm");
 
 const DEFAULT_RELAY_WALLET_HEX: &str = "0xed3cd5befa3207805f8529207cfc0d";
-// v5 controller — deployed 2026-05-26 with full storage maps
-// (target_weights, fees, user_positions). Strict superset of v2:
-// receive_asset MAST root is byte-identical, so v1 atomic notes
-// keep working against this account. The v2 atomic note adds a
-// set_user_position call into slot 10.
-const DEFAULT_CONTROLLER_HEX: &str = "0x9419f2044acb77800a4c91a0cb50e5";
+// v6 controller — deployed 2026-05-26, strict superset of v5 (adds
+// slot 11 fee_recipient + receive_and_credit). For the notes this
+// worker emits (receive_asset + set_user_position), the MAST roots
+// are byte-identical to v5; only the get_* read procs differ. Older
+// deploys can still be targeted via the CLI override.
+const DEFAULT_CONTROLLER_HEX: &str = "0x2a3ea0a268d97b80497d6a966e3141";
 // Miden testnet dETH faucet (the M1 deth-equivalent fungible faucet
 // the basket controllers know about). The 1Click bridge mints
 // `miden-testnet:eth` from a different faucet; for the deposit path
