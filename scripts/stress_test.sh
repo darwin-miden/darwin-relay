@@ -9,6 +9,8 @@
 #                 rebalance threshold tripped, measures steady-state.
 #   3. high     -- 10 deposits in rapid succession across the three
 #                 baskets with varied amounts → exercises queue + nonce.
+#   4. scale    -- 100 deposits fired in parallel across all three
+#                 baskets → stress the relay queue + Miden tx pool.
 #
 # Outputs:
 #   - results/stress-<scenario>-<unix>.tsv with: id, basket, amount,
@@ -55,8 +57,12 @@ Scenarios:
   large     1 large deposit (1,000 USDC into DCC)
   low       5 small deposits (10/15/20/25/50 USDC into DCC)
   high      10 mixed deposits across DCC/DAG/DCO
+  scale     100 parallel deposits across DCC/DAG/DCO
+            (set SCALE_N to override count, default 100;
+             SCALE_PARALLELISM caps concurrent submitters, default 10)
 
 Env: RPC, USER_PK, RELAY, USDC, DCC_ID, DAG_ID, DCO_ID, OUT
+     SCALE_N, SCALE_PARALLELISM
 EOF
 }
 
@@ -109,6 +115,68 @@ case "$SCENARIO" in
     for i in {0..9}; do
       submit_one "$i" "${ids[$((i % 3))]}" "${amounts[$i]}"
     done
+    ;;
+  scale)
+    # Fire N (default 100) deposits with a parallelism cap. The cap
+    # exists because Sepolia public RPCs (publicnode in particular)
+    # rate-limit aggressively past ~12 in-flight `cast send` calls
+    # from one EOA — without the cap we'd just measure 429s, not the
+    # relay's actual throughput.
+    N=${SCALE_N:-100}
+    P=${SCALE_PARALLELISM:-10}
+    ids=("$DCC_ID" "$DAG_ID" "$DCO_ID")
+    amounts=(5000000 10000000 25000000 50000000 100000000)
+
+    # Pre-mint + pre-approve a big bag once instead of per-submit,
+    # so the parallel submitters don't all race to mint themselves.
+    total=$(( N * 100000000 ))
+    echo "[scale] pre-minting $total base-USDC + approving relay"
+    cast send "$USDC" "mint(address,uint256)" "$USER" "$total" \
+      --rpc-url "$RPC" --private-key "$USER_PK" --json >/dev/null 2>&1
+    cast send "$USDC" "approve(address,uint256)" "$RELAY" "$total" \
+      --rpc-url "$RPC" --private-key "$USER_PK" --json >/dev/null 2>&1
+
+    submit_scale_one() {
+      local idx=$1
+      local basket="${ids[$((idx % 3))]}"
+      local amount="${amounts[$((idx % 5))]}"
+      local t0 t1 hash
+      t0=$(date +%s)
+      hash=$(cast send "$RELAY" "deposit(uint256,bytes32,bytes32)" \
+        "$amount" "$basket" "$MIDEN_RECIPIENT" \
+        --rpc-url "$RPC" --private-key "$USER_PK" --json 2>/dev/null \
+        | jq -r .transactionHash 2>/dev/null)
+      t1=$(date +%s)
+      if [[ -n "$hash" && "$hash" != "null" ]]; then
+        echo -e "$idx\t$basket\t$amount\t$hash\t-\t$((t1 - t0))" >> "$results"
+        echo "[scale $idx] tx=$hash submit=$((t1 - t0))s"
+      else
+        echo -e "$idx\t$basket\t$amount\tFAIL\t-\t$((t1 - t0))" >> "$results"
+        echo "[scale $idx] FAIL"
+      fi
+    }
+
+    echo -e "idx\tbasket\tamount_usdc_base\trequest_tx\trequest_block\tsubmit_seconds" > "$results"
+
+    start_wall=$(date +%s)
+    pids=()
+    for i in $(seq 0 $((N - 1))); do
+      submit_scale_one "$i" &
+      pids+=("$!")
+      # Throttle to P concurrent submitters.
+      if (( ${#pids[@]} >= P )); then
+        wait "${pids[0]}" 2>/dev/null
+        pids=("${pids[@]:1}")
+      fi
+    done
+    wait
+    end_wall=$(date +%s)
+
+    ok=$(grep -c -v 'FAIL' "$results" || true)
+    ok=$(( ok - 1 ))   # minus header
+    fail=$(grep -c 'FAIL' "$results" || true)
+    echo
+    echo "[scale] wall=$((end_wall - start_wall))s ok=$ok fail=$fail (N=$N, P=$P)"
     ;;
   help|*)
     usage; exit 1
