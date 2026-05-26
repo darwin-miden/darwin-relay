@@ -50,12 +50,19 @@ use serde::{Deserialize, Serialize};
 // darwin-protocol-account. Kept in sync manually; both repos pin the
 // same miden-assembly 0.22 / miden-protocol 0.14 ABI.
 const ATOMIC_DEPOSIT_NOTE_MASM: &str = include_str!("../../asm/atomic_deposit_note.masm");
+const ATOMIC_DEPOSIT_NOTE_V2_MASM: &str =
+    include_str!("../../asm/atomic_deposit_note_v2.masm");
 const ATOMIC_REDEEM_NOTE_MASM: &str = include_str!("../../asm/atomic_redeem_note.masm");
 const MATH_MASM: &str = include_str!("../../asm/lib/math.masm");
 const BRIDGE_OUT_V1_MASM: &str = include_str!("../../asm/bridge_out_v1.masm");
 
 const DEFAULT_RELAY_WALLET_HEX: &str = "0xed3cd5befa3207805f8529207cfc0d";
-const DEFAULT_CONTROLLER_HEX: &str = "0xa25aa0b00007688024b74b05a52aab";
+// v5 controller — deployed 2026-05-26 with full storage maps
+// (target_weights, fees, user_positions). Strict superset of v2:
+// receive_asset MAST root is byte-identical, so v1 atomic notes
+// keep working against this account. The v2 atomic note adds a
+// set_user_position call into slot 10.
+const DEFAULT_CONTROLLER_HEX: &str = "0x9419f2044acb77800a4c91a0cb50e5";
 // Miden testnet dETH faucet (the M1 deth-equivalent fungible faucet
 // the basket controllers know about). The 1Click bridge mints
 // `miden-testnet:eth` from a different faucet; for the deposit path
@@ -154,11 +161,29 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("attach core_lib: {e}"))?
         .assemble_library([math_module])
         .map_err(|e| anyhow::anyhow!("assemble math.masm: {e}"))?;
-    let deposit_program = TransactionKernel::assembler()
-        .with_static_library(math_lib.as_ref())
-        .map_err(|e| anyhow::anyhow!("attach math_lib (deposit): {e}"))?
-        .assemble_program(ATOMIC_DEPOSIT_NOTE_MASM)
-        .map_err(|e| anyhow::anyhow!("assemble atomic_deposit_note.masm: {e}"))?;
+    // Switch to v2 deposit note when `DARWIN_RELAY_V2_USE_V2_NOTE=1`
+    // is set (default: 1, since we have the v5 controller deployed
+    // today). v2 emits an extra `set_user_position` call on the v5
+    // controller after `receive_asset`, populating slot-10 with the
+    // user's per-basket balance — so the frontend's portfolio panel
+    // can read positions on-chain instead of trusting the relay db.
+    let use_v2_note = std::env::var("DARWIN_RELAY_V2_USE_V2_NOTE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let deposit_program = if use_v2_note {
+        TransactionKernel::assembler()
+            .with_static_library(math_lib.as_ref())
+            .map_err(|e| anyhow::anyhow!("attach math_lib (deposit_v2): {e}"))?
+            .assemble_program(ATOMIC_DEPOSIT_NOTE_V2_MASM)
+            .map_err(|e| anyhow::anyhow!("assemble atomic_deposit_note_v2.masm: {e}"))?
+    } else {
+        TransactionKernel::assembler()
+            .with_static_library(math_lib.as_ref())
+            .map_err(|e| anyhow::anyhow!("attach math_lib (deposit_v1): {e}"))?
+            .assemble_program(ATOMIC_DEPOSIT_NOTE_MASM)
+            .map_err(|e| anyhow::anyhow!("assemble atomic_deposit_note.masm: {e}"))?
+    };
+    info!(use_v2_note, "deposit note variant selected");
     let redeem_program = TransactionKernel::assembler()
         .with_static_library(math_lib.as_ref())
         .map_err(|e| anyhow::anyhow!("attach math_lib (redeem): {e}"))?
@@ -574,16 +599,41 @@ async fn submit_atomic_deposit(
             .as_slice(),
     )?;
 
-    // Storage felts shape per atomic_deposit_note.masm:
+    // Storage felts: v1 atomic_deposit_note expects
     //   [deposit_value, fee_factor, nav_scale]
-    // For the M3 demo we credit 99.7% (30bps mint fee) and keep
-    // nav_scale = deposit_value so basket_amount_minted ≈ amount * 0.997.
+    // v2 (atomic_deposit_note_v2) adds two more felts:
+    //   [..., user_id_suffix, user_id_prefix]
+    // so the v5 controller can write the credit into its slot-10
+    // user_positions StorageMap during the consume tx.
     let nav_scale: u64 = amount;
-    let storage_felts = vec![
+    let mut storage_felts = vec![
         miden_client::Felt::new(amount),
         miden_client::Felt::new(9_970),
         miden_client::Felt::new(nav_scale),
     ];
+    if std::env::var("DARWIN_RELAY_V2_USE_V2_NOTE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+    {
+        // Encode the user's EVM address into two felts: lower 16 bytes
+        // as suffix, upper 4 bytes (zero-padded) as prefix. Stable +
+        // injective for 20-byte addresses.
+        let evm_bytes = hex_to_evm(&intent.user_evm_addr)
+            .unwrap_or([0u8; 20]);
+        let mut suffix_buf = [0u8; 8];
+        let mut prefix_buf = [0u8; 8];
+        // suffix = last 8 bytes of EVM addr (LE u64)
+        suffix_buf.copy_from_slice(&evm_bytes[12..20]);
+        // prefix = next 8 bytes (bytes 4..12) of EVM addr
+        prefix_buf.copy_from_slice(&evm_bytes[4..12]);
+        let user_id_suffix = u64::from_le_bytes(suffix_buf);
+        let user_id_prefix = u64::from_le_bytes(prefix_buf);
+        // Field-element max is p - 1 < 2^64; mask top bit to ensure
+        // we never overflow Felt's canonical range.
+        let mask = (1u64 << 63) - 1;
+        storage_felts.push(miden_client::Felt::new(user_id_suffix & mask));
+        storage_felts.push(miden_client::Felt::new(user_id_prefix & mask));
+    }
     let recipient = NoteRecipient::new(
         serial_num,
         note_script.clone(),
@@ -1130,6 +1180,18 @@ async fn process_outbound_status(
         }
     }
     Ok(())
+}
+
+fn hex_to_evm(s: &str) -> Option<[u8; 20]> {
+    let h = s.strip_prefix("0x").unwrap_or(s);
+    if h.len() != 40 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    for i in 0..20 {
+        out[i] = u8::from_str_radix(&h[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 fn parse_miden_account(s: &str) -> Result<AccountId> {

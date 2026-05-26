@@ -1,0 +1,113 @@
+# Atomic DepositNote v2 — atomic_deposit_note + per-user storage write.
+#
+# Adds the M1.4b leg: after the asset lands in the v5 controller's
+# vault, the note calls `set_user_position` to write the credited
+# basket-token amount into the controller's slot-10 StorageMap.
+# That makes the v5 controller the authoritative ledger for per-user
+# positions on Miden (no off-chain accounting needed for ETH-via-relay
+# users on the read side).
+#
+# Storage felts layout (5 felts):
+#   storage[0] = deposit_value
+#   storage[1] = fee_factor
+#   storage[2] = nav_scale
+#   storage[3] = user_id_suffix       (felt)
+#   storage[4] = user_id_prefix       (felt)
+#
+# The basket_id used as the second half of the user_basket_key is
+# derived from the asset's faucet id (not from storage) — that's the
+# faucet that the note brought into the controller. The note script
+# reads the faucet id from the first asset's vault key while looping
+# through `drain_assets_into_controller`.
+#
+# Requires v5 controller (procedures @ MAST roots below).
+
+use darwin::math
+use miden::protocol::active_note
+use miden::protocol::asset::ASSET_VALUE_MEMORY_OFFSET
+use miden::protocol::asset::ASSET_SIZE
+
+# MAST root references (v5 controller):
+#   receive_asset       0x75f638c65584d058542bcf4674b066ae394183021bc9b44dc2fdd97d52f9bcfb
+#   set_user_position   0x8d41bee5930524a81ffc0012a2505a700d2ad837a6eb395842ccd733a14423fb
+
+@locals(2048)
+proc drain_assets_into_controller
+    locaddr.0 exec.active_note::get_assets
+    mul.ASSET_SIZE dup.1 add
+    padw padw movup.9
+    dup dup.10 neq
+    while.true
+        dup movdn.9
+        add.ASSET_VALUE_MEMORY_OFFSET mem_loadw_le swapw
+        dup.8 mem_loadw_le
+        padw padw swapdw
+        call.0x75f638c65584d058542bcf4674b066ae394183021bc9b44dc2fdd97d52f9bcfb
+        dropw dropw
+        movup.8 add.ASSET_SIZE dup
+        dup.10 neq
+    end
+    drop dropw dropw drop
+end
+
+# Compute mint_amount from storage felts AND keep it on the stack so
+# the user_position write below can read it.
+#
+# Stack on exit (extra to the v1 version): [mint_amount]
+proc compute_mint_amount_from_storage
+    push.100
+    exec.active_note::get_storage
+    drop drop
+
+    push.100 mem_load                 # deposit_value
+    push.101 mem_load                 # fee_factor
+    push.102 mem_load                 # nav_scale
+    mul
+    exec.math::felt_div
+    # leave mint_amount on the top of the stack
+end
+
+# Write the user's basket-token credit into v5 controller's slot 10
+# StorageMap.
+#
+# Stack on entry: [mint_amount, pad...]
+# Stack on exit:  [pad (depth 16)]
+#
+# set_user_position signature:
+#   [user_basket_key_word(4), value_word(4), pad(8)] →
+#   [old_value_word(4), pad]
+proc write_user_position
+    # Read user_id felts from storage[3], storage[4].
+    push.103 mem_load                 # user_id_suffix
+    push.104 mem_load                 # user_id_prefix
+    # For now use basket_id = (0, 0) — the basket discriminator is
+    # already implicit in the controller account being targeted. M4
+    # adds a second basket field in storage for multi-basket
+    # controllers.
+    push.0 push.0
+    # Stack: [basket_id_prefix=0, basket_id_suffix=0,
+    #         user_id_prefix, user_id_suffix, mint_amount, pad]
+    # set_map_item expects the KEY word in stack-bottom order:
+    # [user_id_suffix, user_id_prefix, basket_id_suffix, basket_id_prefix, ...]
+    # Our current top is basket_id_prefix → matches.
+
+    # Build NEW_VALUE = [mint_amount, 0, 0, 0]. Already have mint_amount
+    # at stack idx 4 (after pushing 4 key felts). Move it up:
+    movup.4                            # [mint_amount, key(4), pad]
+    push.0 push.0 push.0               # [0, 0, 0, mint_amount, key(4), pad]
+    # Now stack: [value(4), key(4), pad]. set_user_position wants
+    # [key(4), value(4)] order:
+    swapw                              # [key(4), value(4), pad]
+
+    call.0xa017ac3e12d53bad11bfb8b4289a3bd2c4deef4c67a5209c53703dacbbe2d335
+    # Stack: [old_value(4), pad]
+    dropw                              # [pad]
+end
+
+begin
+    exec.compute_mint_amount_from_storage
+    # Stack: [mint_amount, pad]
+    exec.write_user_position
+    # Stack: [pad depth 16]
+    exec.drain_assets_into_controller
+end
