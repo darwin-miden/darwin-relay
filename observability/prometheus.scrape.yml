@@ -1,0 +1,19 @@
+# Prometheus scrape snippet for darwin-relay-v2.
+#
+# Drop this into the `scrape_configs:` list of an existing prometheus.yml,
+# or use it standalone with `prometheus --config.file=prometheus.scrape.yml`.
+#
+# The relay exposes /metrics on the same axum listener as the REST API,
+# so the scrape target is just $RELAY_BASE/metrics. No auth — it's
+# expected to be behind the same network boundary as the REST surface.
+
+scrape_configs:
+  - job_name: darwin-relay-v2
+    metrics_path: /metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - localhost:8090       # dev default — relay --bind 0.0.0.0:8090
+        labels:
+          service: darwin-relay
+          env: dev

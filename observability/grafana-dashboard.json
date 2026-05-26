@@ -1,0 +1,122 @@
+{
+  "title": "Darwin Relay v2",
+  "description": "Intents + redemptions + positions for the Miden-side custodial relay.",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "tags": ["darwin", "miden"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Relay up",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        {
+          "expr": "darwin_relay_up",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Positions tracked",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        {
+          "expr": "darwin_relay_positions",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Intents settled",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(darwin_relay_intents_total{stage=~\"settled|atomic_deposit_minted\"})",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Intents in flight",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(darwin_relay_intents_total{stage!~\"settled|atomic_deposit_minted|failed|expired\"})",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Intents failed",
+      "gridPos": { "x": 16, "y": 0, "w": 4, "h": 4 },
+      "targets": [
+        {
+          "expr": "sum(darwin_relay_intents_total{stage=~\"failed|expired\"})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Intents by stage (over time)",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "darwin_relay_intents_total",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Redemptions by stage (over time)",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "darwin_relay_redemptions_total",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" }
+}

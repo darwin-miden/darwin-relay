@@ -628,6 +628,80 @@ async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "service": "darwin-relay-v2" }))
 }
 
+// Plain-text Prometheus exposition. Pulled live from sqlite so the
+// service can run a single instance — no in-memory counter to lose
+// on restart.
+async fn metrics(State(state): State<Arc<AppState>>) -> (StatusCode, String) {
+    let db = state.db.lock().await;
+
+    let intent_stages = match db
+        .prepare("SELECT stage, COUNT(*) FROM intents GROUP BY stage")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<rusqlite::Result<Vec<(String, i64)>>>()
+        }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("# metrics query failed: {e}\n"),
+            )
+        }
+    };
+    let redemption_stages = match db
+        .prepare("SELECT stage, COUNT(*) FROM redemptions GROUP BY stage")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<rusqlite::Result<Vec<(String, i64)>>>()
+        }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("# metrics query failed: {e}\n"),
+            )
+        }
+    };
+    let position_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0))
+        .unwrap_or(0);
+
+    let mut out = String::with_capacity(1024);
+    out.push_str("# HELP darwin_relay_intents_total Intents grouped by stage.\n");
+    out.push_str("# TYPE darwin_relay_intents_total gauge\n");
+    for (stage, n) in &intent_stages {
+        out.push_str(&format!(
+            "darwin_relay_intents_total{{stage=\"{}\"}} {}\n",
+            escape_label(stage),
+            n
+        ));
+    }
+    out.push_str("# HELP darwin_relay_redemptions_total Redemptions grouped by stage.\n");
+    out.push_str("# TYPE darwin_relay_redemptions_total gauge\n");
+    for (stage, n) in &redemption_stages {
+        out.push_str(&format!(
+            "darwin_relay_redemptions_total{{stage=\"{}\"}} {}\n",
+            escape_label(stage),
+            n
+        ));
+    }
+    out.push_str("# HELP darwin_relay_positions Distinct (user, basket) positions tracked.\n");
+    out.push_str("# TYPE darwin_relay_positions gauge\n");
+    out.push_str(&format!("darwin_relay_positions {position_count}\n"));
+
+    out.push_str("# HELP darwin_relay_up 1 if the service is alive.\n");
+    out.push_str("# TYPE darwin_relay_up gauge\n");
+    out.push_str("darwin_relay_up 1\n");
+
+    (StatusCode::OK, out)
+}
+
+fn escape_label(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 fn internal_err(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -867,6 +941,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v0/intents", post(create_intent))
         .route("/v0/intents/:correlation_id", get(get_intent))
         .route("/v0/intents/:correlation_id/deposit", post(attach_deposit))
