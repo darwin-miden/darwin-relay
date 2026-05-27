@@ -1691,7 +1691,14 @@ async fn process_outbound_status_b2agg(
             Ok(a) => a,
             Err(_) => continue,
         };
-        let expected_underlying = basket_amount_u64.saturating_mul(9_970) / 10_000;
+        // The relay's basket_amount is in Miden 8-decimal base units
+        // (same scale as the Bali ETH faucet on the L2 side). The
+        // agglayer bridge service reports the amount as L1 wei
+        // (18-decimal). The 10^10 factor closes the decimal gap
+        // between Miden's 8-dec faucet representation and Sepolia's
+        // 18-dec ETH wei representation.
+        let expected_underlying_miden = basket_amount_u64.saturating_mul(9_970) / 10_000;
+        let expected_underlying_wei = expected_underlying_miden.saturating_mul(10_000_000_000);
 
         let url = format!(
             "{}/api/bridges/{}",
@@ -1747,7 +1754,7 @@ async fn process_outbound_status_b2agg(
             if dest_addr != user_evm_addr.to_lowercase() {
                 continue;
             }
-            if amount != expected_underlying {
+            if amount != expected_underlying_wei {
                 continue;
             }
             if claim_tx.is_empty() {
