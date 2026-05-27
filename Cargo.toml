@@ -40,6 +40,16 @@ optional = true
 version  = "0.14"
 optional = true
 
+# AggLayer B2AGG note format. Published as `miden-agglayer` on crates.io
+# but aliased locally as `miden-base-agglayer` so it groups with the
+# miden-base-* deps + matches the import name the gateway-fm reference
+# code uses. Powers the v2 worker's canonical Bali outbound (replaces
+# the legacy bridge_out_v1 mock format Brian's testnet bridge uses).
+[dependencies.miden-base-agglayer]
+package  = "miden-agglayer"
+version  = "=0.14.4"
+optional = true
+
 [features]
 default = []
 # Real Miden-client integration. Off by default so the deposit FSM
@@ -69,6 +79,7 @@ v2-worker = [
     "dep:miden-core-lib",
     "dep:miden-objects",
     "dep:miden-standards",
+    "dep:miden-base-agglayer",
     "dep:rand",
 ]
 

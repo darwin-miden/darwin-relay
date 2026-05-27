@@ -41,6 +41,12 @@ use miden_client::note::{
 };
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_client_sqlite_store::SqliteStore;
+
+// Canonical Bali AggLayer note format. The B2AggNote::create call
+// returns a Note whose script_root matches what the L1 bridge
+// expects, so we don't have to vendor the MASM ourselves — the
+// crate keeps it pinned to the consensus layer.
+use miden_base_agglayer::{B2AggNote, EthAddress};
 use miden_core_lib::CoreLibrary;
 use miden_protocol::transaction::TransactionKernel;
 use rand::RngCore;
@@ -79,6 +85,21 @@ const DEFAULT_DETH_FAUCET_HEX: &str = "0xa095d9b3831e96206ff70c2218a6a9";
 // usable assets. Configurable via env.
 const DEFAULT_ONECLICK_FAUCET_HEX: &str = "0x7aabde381e7ac6a06b22534a6900cb";
 const DEFAULT_ONECLICK_URL: &str = "http://localhost:8080";
+
+// Canonical Bali AggLayer (gateway-fm) — used by the B2AGG outbound
+// path. Different from the 1Click constants above: the Bali bridge
+// account + faucet are operated by gateway-fm, the L1↔L2 round-trip
+// is permissionless (proof-based on Sepolia), and the relay does
+// not need to involve a 1Click solver.
+const DEFAULT_BALI_BRIDGE_HEX: &str = "0xc98bb07c188cd2500e13f68a069cdc";
+const DEFAULT_BALI_FAUCET_HEX: &str = "0xe63ba7bc2c19ff603c52c67fa4426d";
+const DEFAULT_BALI_BRIDGE_SERVICE: &str =
+    "https://miden-testnet-bridge.dev.eu-north-3.gateway.fm";
+// Outbound modes: "b2agg" (default, canonical Bali) or
+// "bridge_out_v1" (legacy, Brian's 1Click mock format). Keep the
+// legacy path behind a flag for backwards-compat with deployments
+// still pointed at the 1Click mock; otherwise default to canonical.
+const DEFAULT_OUTBOUND_MODE: &str = "b2agg";
 const ONECLICK_ORIGIN_ASSET: &str = "miden-testnet:eth";
 const ONECLICK_DEST_ASSET: &str = "eth-sepolia:eth";
 
@@ -113,6 +134,14 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| DEFAULT_ONECLICK_FAUCET_HEX.to_string());
     let oneclick_url = std::env::var("DARWIN_RELAY_V2_ONECLICK_URL")
         .unwrap_or_else(|_| DEFAULT_ONECLICK_URL.to_string());
+    let bali_bridge_hex = std::env::var("DARWIN_RELAY_V2_BALI_BRIDGE_HEX")
+        .unwrap_or_else(|_| DEFAULT_BALI_BRIDGE_HEX.to_string());
+    let bali_faucet_hex = std::env::var("DARWIN_RELAY_V2_BALI_FAUCET_HEX")
+        .unwrap_or_else(|_| DEFAULT_BALI_FAUCET_HEX.to_string());
+    let bali_bridge_service = std::env::var("DARWIN_RELAY_V2_BALI_BRIDGE_SERVICE")
+        .unwrap_or_else(|_| DEFAULT_BALI_BRIDGE_SERVICE.to_string());
+    let outbound_mode = std::env::var("DARWIN_RELAY_V2_OUTBOUND_MODE")
+        .unwrap_or_else(|_| DEFAULT_OUTBOUND_MODE.to_string());
     let poll_interval_s: u64 = std::env::var("DARWIN_RELAY_V2_WORKER_INTERVAL_S")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -122,6 +151,8 @@ async fn main() -> Result<()> {
     let controller = AccountId::from_hex(&controller_hex)?;
     let deth_faucet = AccountId::from_hex(&faucet_hex)?;
     let oneclick_faucet = AccountId::from_hex(&oneclick_faucet_hex)?;
+    let bali_bridge = AccountId::from_hex(&bali_bridge_hex)?;
+    let bali_faucet = AccountId::from_hex(&bali_faucet_hex)?;
 
     info!(
         %store_path,
@@ -131,6 +162,9 @@ async fn main() -> Result<()> {
         %faucet_hex,
         %oneclick_faucet_hex,
         %oneclick_url,
+        %bali_bridge_hex,
+        %bali_faucet_hex,
+        %outbound_mode,
         poll_interval_s,
         "darwin-relay-v2 worker starting",
     );
@@ -211,6 +245,10 @@ async fn main() -> Result<()> {
             deth_faucet,
             oneclick_faucet,
             &oneclick_url,
+            bali_bridge,
+            bali_faucet,
+            &bali_bridge_service,
+            &outbound_mode,
             &http,
             &deposit_script,
             &redeem_script,
@@ -233,6 +271,10 @@ async fn tick(
     deth_faucet: AccountId,
     oneclick_faucet: AccountId,
     oneclick_url: &str,
+    bali_bridge: AccountId,
+    bali_faucet: AccountId,
+    bali_bridge_service: &str,
+    outbound_mode: &str,
     http: &reqwest::Client,
     deposit_script: &NoteScript,
     redeem_script: &NoteScript,
@@ -268,18 +310,54 @@ async fn tick(
     )
     .await?;
 
-    process_outbound(
-        client,
-        relay_store_path,
-        relay_wallet,
-        oneclick_faucet,
-        oneclick_url,
-        http,
-        bridge_out_script,
-    )
-    .await?;
-
-    process_outbound_status(relay_store_path, oneclick_url, http).await?;
+    match outbound_mode {
+        "b2agg" => {
+            process_outbound_b2agg(
+                client,
+                relay_store_path,
+                relay_wallet,
+                bali_bridge,
+                bali_faucet,
+            )
+            .await?;
+            process_outbound_status_b2agg(
+                relay_store_path,
+                bali_bridge_service,
+                http,
+            )
+            .await?;
+        }
+        "bridge_out_v1" => {
+            process_outbound(
+                client,
+                relay_store_path,
+                relay_wallet,
+                oneclick_faucet,
+                oneclick_url,
+                http,
+                bridge_out_script,
+            )
+            .await?;
+            process_outbound_status(relay_store_path, oneclick_url, http).await?;
+        }
+        other => {
+            warn!(mode = %other, "unknown outbound mode — falling back to b2agg");
+            process_outbound_b2agg(
+                client,
+                relay_store_path,
+                relay_wallet,
+                bali_bridge,
+                bali_faucet,
+            )
+            .await?;
+            process_outbound_status_b2agg(
+                relay_store_path,
+                bali_bridge_service,
+                http,
+            )
+            .await?;
+        }
+    }
 
     Ok(())
 }
@@ -1372,6 +1450,343 @@ struct OutboundPending {
     redemption_id: String,
     user_evm_addr: String,
     basket_amount: String,
+}
+
+/// Canonical Bali outbound: emit a B2AGG note from the relay wallet
+/// → user's Sepolia EOA via the Bali bridge account. Permissionless
+/// (no 1Click solver in the loop). Settles on the L1 side once the
+/// user (or anyone) calls `claimAsset` with the merkle proof —
+/// `process_outbound_status_b2agg` watches the bridge service for
+/// that and writes back to sqlite.
+async fn process_outbound_b2agg(
+    client: &mut miden_client::Client<FilesystemKeyStore>,
+    relay_store_path: &str,
+    relay_wallet: AccountId,
+    bali_bridge: AccountId,
+    bali_faucet: AccountId,
+) -> Result<()> {
+    let pending = load_outbound_pending(relay_store_path)?;
+    if pending.is_empty() {
+        info!("no outbound legs pending — idle (b2agg)");
+        return Ok(());
+    }
+    info!(count = pending.len(), "redemptions needing outbound bridge (b2agg)");
+
+    let relay_acct = client
+        .get_account(relay_wallet)
+        .await?
+        .with_context(|| format!("relay wallet {} not in store", relay_wallet.to_hex()))?;
+    let vault_balance = relay_acct.vault().get_balance(bali_faucet).unwrap_or(0);
+    info!(
+        relay_wallet = %relay_wallet.to_hex(),
+        bali_faucet  = %bali_faucet.to_hex(),
+        balance      = vault_balance,
+        "relay outbound vault snapshot (b2agg)",
+    );
+
+    for redemption in pending {
+        let basket_amount: u64 = match redemption.basket_amount.parse() {
+            Ok(a) => a,
+            Err(_) => {
+                warn!(
+                    redemption_id = %redemption.redemption_id,
+                    amount = %redemption.basket_amount,
+                    "amount doesn't fit in u64 — skipping",
+                );
+                continue;
+            }
+        };
+        // Same 30 bps redeem-fee net the legacy path applied. M4 will
+        // route through Pragma + per-constituent pro-rata.
+        let underlying = basket_amount.saturating_mul(9_970) / 10_000;
+
+        if vault_balance < underlying {
+            info!(
+                redemption_id = %redemption.redemption_id,
+                need = underlying,
+                have = vault_balance,
+                "outbound faucet under-funded — leaving for next tick",
+            );
+            continue;
+        }
+
+        let l1_dest = match EthAddress::from_hex(&redemption.user_evm_addr) {
+            Ok(a) => a,
+            Err(e) => {
+                error!(redemption_id = %redemption.redemption_id, error = ?e, "user_evm_addr parse failed");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("user_evm_addr parse: {e:?}"),
+                )?;
+                continue;
+            }
+        };
+
+        let asset = match FungibleAsset::new(bali_faucet, underlying) {
+            Ok(a) => Asset::Fungible(a),
+            Err(e) => {
+                error!(redemption_id = %redemption.redemption_id, error = %e, "fungible asset build failed");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("fungible asset: {e}"),
+                )?;
+                continue;
+            }
+        };
+        let assets = match NoteAssets::new(vec![asset]) {
+            Ok(a) => a,
+            Err(e) => {
+                error!(redemption_id = %redemption.redemption_id, error = %e, "note assets build failed");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("note assets: {e}"),
+                )?;
+                continue;
+            }
+        };
+
+        let b2agg = match B2AggNote::create(
+            0, // destination_network = Ethereum L1 (Sepolia)
+            l1_dest,
+            assets,
+            bali_bridge,
+            relay_wallet,
+            client.rng(),
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                error!(redemption_id = %redemption.redemption_id, error = %e, "B2AGG note build failed");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("B2AGG build: {e}"),
+                )?;
+                continue;
+            }
+        };
+
+        let req = match TransactionRequestBuilder::new()
+            .own_output_notes(vec![b2agg])
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!(redemption_id = %redemption.redemption_id, error = %e, "B2AGG tx-request build failed");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("B2AGG req: {e}"),
+                )?;
+                continue;
+            }
+        };
+
+        let tx_hex = match client.execute_transaction(relay_wallet, req).await {
+            Ok(result) => {
+                let id = result.executed_transaction().id();
+                let prover = client.prover();
+                let proven = match client.prove_transaction_with(&result, prover).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!(redemption_id = %redemption.redemption_id, error = %e, "B2AGG prove failed");
+                        mark_redemption_error(
+                            relay_store_path,
+                            &redemption.redemption_id,
+                            &format!("B2AGG prove: {e}"),
+                        )?;
+                        continue;
+                    }
+                };
+                let height = match client.submit_proven_transaction(proven, &result).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!(redemption_id = %redemption.redemption_id, error = %e, "B2AGG submit failed");
+                        mark_redemption_error(
+                            relay_store_path,
+                            &redemption.redemption_id,
+                            &format!("B2AGG submit: {e}"),
+                        )?;
+                        continue;
+                    }
+                };
+                if let Err(e) = client.apply_transaction(&result, height).await {
+                    warn!(redemption_id = %redemption.redemption_id, error = %e, "B2AGG apply_transaction warning");
+                }
+                info!(
+                    redemption_id = %redemption.redemption_id,
+                    miden_bridge_out_tx = %id,
+                    height = %height,
+                    "B2AGG outbound emitted",
+                );
+                format!("{id}")
+            }
+            Err(e) => {
+                error!(redemption_id = %redemption.redemption_id, error = %e, "B2AGG execute failed");
+                mark_redemption_error(
+                    relay_store_path,
+                    &redemption.redemption_id,
+                    &format!("B2AGG execute: {e}"),
+                )?;
+                continue;
+            }
+        };
+
+        // For the b2agg path there's no 1Click correlation — write
+        // the Miden tx hash and leave oneclick_correlation empty.
+        // process_outbound_status_b2agg watches the bridge service
+        // for the claim_tx_hash later.
+        mark_redemption_outbound(
+            relay_store_path,
+            &redemption.redemption_id,
+            &tx_hex,
+            "", // no 1Click correlation_id
+            "", // no 1Click deposit_address
+        )?;
+    }
+    Ok(())
+}
+
+/// Watch the Bali bridge service for L1 claim transactions matching
+/// the redemptions we have in flight, and update sqlite when one
+/// lands. This is the b2agg analogue of `process_outbound_status`
+/// (which polls 1Click for completion). Without this step the
+/// RelayRedemptionsPanel never shows a sepolia_release_tx for a
+/// redemption that's actually been claimed on Sepolia.
+async fn process_outbound_status_b2agg(
+    relay_store_path: &str,
+    bridge_service_url: &str,
+    http: &reqwest::Client,
+) -> Result<()> {
+    let conn = Connection::open(relay_store_path)?;
+    let mut stmt = conn.prepare(
+        r#"SELECT redemption_id, user_evm_addr, basket_amount
+              FROM redemptions
+              WHERE miden_bridge_out_tx IS NOT NULL
+                AND (sepolia_release_tx IS NULL OR sepolia_release_tx = '')
+                AND (error IS NULL OR error = '')
+              ORDER BY created_at ASC"#,
+    )?;
+    let rows = stmt
+        .query_map(params![], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    drop(conn);
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+    info!(count = rows.len(), "polling bali bridge service for L1 claims");
+
+    for (redemption_id, user_evm_addr, basket_amount) in rows {
+        let basket_amount_u64: u64 = match basket_amount.parse() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let expected_underlying = basket_amount_u64.saturating_mul(9_970) / 10_000;
+
+        let url = format!(
+            "{}/api/bridges/{}",
+            bridge_service_url.trim_end_matches('/'),
+            user_evm_addr.to_lowercase(),
+        );
+        let resp = match http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(redemption_id = %redemption_id, error = %e, "bali bridge service http failed");
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            warn!(redemption_id = %redemption_id, status = %resp.status(), "bali bridge service non-2xx");
+            continue;
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(redemption_id = %redemption_id, error = %e, "bali bridge service decode failed");
+                continue;
+            }
+        };
+        let deposits = body.get("deposits").and_then(|d| d.as_array());
+        let Some(deposits) = deposits else { continue };
+
+        // Match by (dest_addr eq user) AND (amount eq expected) AND
+        // (claim_tx_hash present). The bridge service indexes our
+        // outbound burns under the L1 dest_addr; multiple redemptions
+        // from the same user could be in flight, so we additionally
+        // disambiguate by amount.
+        for dep in deposits {
+            let dest_addr = dep
+                .get("dest_addr")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_lowercase();
+            let amount = dep
+                .get("amount")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let claim_tx = dep
+                .get("claim_tx_hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let dest_net = dep.get("dest_net").and_then(|v| v.as_u64()).unwrap_or(99);
+
+            if dest_net != 0 {
+                continue;
+            }
+            if dest_addr != user_evm_addr.to_lowercase() {
+                continue;
+            }
+            if amount != expected_underlying {
+                continue;
+            }
+            if claim_tx.is_empty() {
+                continue;
+            }
+
+            mark_redemption_sepolia_release(relay_store_path, &redemption_id, claim_tx)?;
+            info!(
+                redemption_id = %redemption_id,
+                sepolia_release_tx = %claim_tx,
+                "B2AGG claim landed on Sepolia, marked sepolia_release_tx",
+            );
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Helper used by both the 1Click + b2agg status pollers — sets
+/// `sepolia_release_tx` when the L1 release has been observed.
+fn mark_redemption_sepolia_release(
+    store_path: &str,
+    redemption_id: &str,
+    tx_hex: &str,
+) -> Result<()> {
+    let conn = Connection::open(store_path)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    conn.execute(
+        r#"UPDATE redemptions
+              SET sepolia_release_tx = ?2,
+                  stage              = 'SETTLED',
+                  updated_at         = ?3
+              WHERE redemption_id = ?1"#,
+        params![redemption_id, tx_hex, now],
+    )?;
+    Ok(())
 }
 
 fn load_outbound_pending(store_path: &str) -> Result<Vec<OutboundPending>> {
