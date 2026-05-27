@@ -1661,12 +1661,20 @@ async fn process_outbound_status_b2agg(
     http: &reqwest::Client,
 ) -> Result<()> {
     let conn = Connection::open(relay_store_path)?;
+    // Only poll b2agg-mode outbounds. Legacy bridge_out_v1 (Brian's
+    // 1Click mock) entries have a non-empty oneclick_correlation
+    // ('<correlation_id>|<deposit_address>'); b2agg entries get
+    // mark_redemption_outbound called with two empty strings → the
+    // joined value is just the separator '|'. Filtering on that
+    // prevents the poller from cross-matching old 1Click redemptions
+    // against new canonical Bali outbounds when their amounts collide.
     let mut stmt = conn.prepare(
         r#"SELECT redemption_id, user_evm_addr, basket_amount
               FROM redemptions
               WHERE miden_bridge_out_tx IS NOT NULL
                 AND (sepolia_release_tx IS NULL OR sepolia_release_tx = '')
                 AND (error IS NULL OR error = '')
+                AND (oneclick_correlation = '|' OR oneclick_correlation IS NULL OR oneclick_correlation = '')
               ORDER BY created_at ASC"#,
     )?;
     let rows = stmt
