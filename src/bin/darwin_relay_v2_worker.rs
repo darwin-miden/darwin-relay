@@ -717,14 +717,22 @@ async fn submit_atomic_deposit(
 
     // Storage felts: v1 atomic_deposit_note expects
     //   [deposit_value, fee_factor, nav_scale]
-    // v2 (atomic_deposit_note_v2) adds two more felts:
-    //   [..., user_id_suffix, user_id_prefix]
-    // so the v5 controller can write the credit into its slot-10
-    // user_positions StorageMap during the consume tx.
-    let nav_scale: u64 = amount;
+    // The note computes the slot-10 credit as
+    //   deposit_value * fee_factor / nav_scale.
+    // We want the on-chain credit to equal the deposited base-unit
+    // amount (so it matches the off-chain RelayPositionsPanel, which
+    // credits the same ÷10^10-scaled amount). Setting nav_scale =
+    // fee_factor makes the two cancel → credit = deposit_value =
+    // amount. (The earlier nav_scale=amount made deposit_value and
+    // nav_scale cancel instead, pinning the credit to a constant
+    // 9970 regardless of deposit size — which is what diverged from
+    // the off-chain ledger.) The 30 bps redeem fee is applied on the
+    // redeem leg, not here.
+    const FEE_FACTOR: u64 = 10_000;
+    let nav_scale: u64 = FEE_FACTOR;
     let mut storage_felts = vec![
         miden_client::Felt::new(amount),
-        miden_client::Felt::new(9_970),
+        miden_client::Felt::new(FEE_FACTOR),
         miden_client::Felt::new(nav_scale),
     ];
     if std::env::var("DARWIN_RELAY_V2_USE_V2_NOTE")

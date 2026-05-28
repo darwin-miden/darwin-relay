@@ -799,9 +799,22 @@ async fn poll_one_intent(state: &Arc<AppState>, mut intent: Intent) -> Result<()
             // Stage transition recorded here; the submit hook
             // observer can drive the rest.
             intent.stage = "POSITION_CREDITED".to_string();
-            // 1:1 USD-equivalent at par for the M3 demo. M4 reads
-            // live Pragma + applies pro-rata across constituents.
-            let basket_amount = intent.amount_in_wei.clone();
+            // The frontend sends amount_in_wei in EVM 18-decimal wei.
+            // The Miden side (dETH faucet, controller slot-10 credit)
+            // operates in the 8-decimal convention, so the worker
+            // scales the on-chain deposit by ÷10^10. Mirror that here
+            // so the off-chain ledger (RelayPositionsPanel) shows the
+            // same base-unit quantity the on-chain atomic_deposit
+            // credits to the controller's slot 10 — otherwise the two
+            // portfolio panels diverge by 10 orders of magnitude.
+            // 1:1 USD-equivalent at par for the M3 demo; M4 reads live
+            // Pragma + applies pro-rata across constituents.
+            const WEI_PER_MIDEN_BASE: u128 = 10_000_000_000; // 18-dec → 8-dec
+            let basket_amount = intent
+                .amount_in_wei
+                .parse::<u128>()
+                .map(|wei| (wei / WEI_PER_MIDEN_BASE).max(1).to_string())
+                .unwrap_or_else(|_| intent.amount_in_wei.clone());
             intent.basket_amount_minted = Some(basket_amount.clone());
             let db = state.db.lock().await;
             credit_position(
