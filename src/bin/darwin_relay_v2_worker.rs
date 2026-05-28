@@ -488,22 +488,33 @@ async fn process_deposits(
     );
 
     for intent in pending {
-        let amount = match intent.amount_in_wei.parse::<u64>() {
+        let amount_wei = match intent.amount_in_wei.parse::<u128>() {
             Ok(a) => a,
             Err(_) => {
                 warn!(
                     correlation_id = %intent.correlation_id,
                     amount = %intent.amount_in_wei,
-                    "amount doesn't fit in u64 — skipping",
+                    "amount doesn't parse — skipping",
                 );
                 mark_intent_error(
                     relay_store_path,
                     &intent.correlation_id,
-                    "amount overflows u64",
+                    "amount_in_wei unparseable",
                 )?;
                 continue;
             }
         };
+        // The frontend sends amount_in_wei in EVM 18-decimal wei
+        // (parseEther). The Miden dETH faucet operates in the 8-decimal
+        // convention used across the Darwin Miden side (the Bali ETH
+        // faucet is 8-dec too) and is test-grade — its max_supply is
+        // only 1e7 base units, so a raw 1e13-wei amount can never be
+        // backed. Map wei → 8-dec faucet base units (÷10^10): a
+        // 0.00001 ETH deposit (1e13 wei) becomes 1000 dETH base units,
+        // which fits both the faucet supply and the relay's holdings.
+        const WEI_PER_MIDEN_BASE: u128 = 10_000_000_000; // 18-dec → 8-dec
+        let amount: u64 = u64::try_from((amount_wei / WEI_PER_MIDEN_BASE).max(1))
+            .unwrap_or(u64::MAX);
         if vault_balance < amount {
             info!(
                 correlation_id = %intent.correlation_id,
