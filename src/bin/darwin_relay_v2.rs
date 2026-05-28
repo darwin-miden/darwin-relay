@@ -939,6 +939,19 @@ async fn main() -> Result<()> {
         poll_loop(poll_state, Duration::from_secs(poll_interval_s)).await;
     });
 
+    // CORS — the frontend calls this REST directly from the browser
+    // (OneClickDepositPanel POSTs /v0/intents, RelayRedemptionsPanel
+    // GETs /v0/redemptions, etc.) from a different origin
+    // (localhost:3010 in dev, darwin.xyz in prod). Without an
+    // Access-Control-Allow-Origin header the browser blocks the
+    // preflight and the panels show "Failed to fetch". Allow any
+    // origin + the methods/headers the panels use — this is a public
+    // read/write testnet relay, no credentials or cookies involved.
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any);
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -949,6 +962,7 @@ async fn main() -> Result<()> {
         .route("/v0/redeem/:redemption_id", get(get_redemption))
         .route("/v0/redemptions/:user_evm_addr", get(list_redemptions_for_user))
         .route("/v0/positions/:user_evm_addr", get(get_positions))
+        .layer(cors)
         .with_state(state);
 
     let addr: SocketAddr = bind.parse().context("parse bind addr")?;

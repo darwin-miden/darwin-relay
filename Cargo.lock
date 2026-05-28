@@ -1868,6 +1868,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",

@@ -67,6 +67,7 @@ v2 = [
     "dep:axum",
     "dep:uuid",
     "dep:reqwest",
+    "dep:tower-http",
 ]
 # Worker that drives the on-chain atomic_deposit_note submission for
 # v2-credited intents. Brings in the full miden-client + assembler
@@ -109,6 +110,14 @@ optional = true
 
 [dependencies.axum]
 version = "0.7"
+optional = true
+
+# CORS layer so the frontend (localhost:3010 / darwin.xyz) can call
+# the relay REST from the browser. axum 0.7 → tower-http 0.6 (both
+# on http 1.x).
+[dependencies.tower-http]
+version  = "0.6"
+features = ["cors"]
 optional = true
 
 [dependencies.uuid]
