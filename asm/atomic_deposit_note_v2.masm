@@ -1,11 +1,13 @@
 # Atomic DepositNote v2 — atomic_deposit_note + per-user storage write.
 #
 # Adds the M1.4b leg: after the asset lands in the v5 controller's
-# vault, the note calls `set_user_position` to write the credited
-# basket-token amount into the controller's slot-10 StorageMap.
-# That makes the v5 controller the authoritative ledger for per-user
-# positions on Miden (no off-chain accounting needed for ETH-via-relay
-# users on the read side).
+# vault, the note credits the user's slot-10 StorageMap position.
+# The position ACCUMULATES across deposits: the note first reads the
+# current slot-10 amount via `get_user_position`, adds the freshly
+# minted amount, then writes the total back via `set_user_position`.
+# This matches the relay's off-chain ledger (which sums every deposit)
+# so the on-chain controller stays the authoritative per-user total
+# rather than only reflecting the most recent deposit.
 #
 # Storage felts layout (5 felts):
 #   storage[0] = deposit_value
@@ -23,6 +25,7 @@
 # Requires v5 controller (procedures @ MAST roots below).
 
 use darwin::math
+use miden::core::sys
 use miden::protocol::active_note
 use miden::protocol::asset::ASSET_VALUE_MEMORY_OFFSET
 use miden::protocol::asset::ASSET_SIZE
@@ -30,6 +33,10 @@ use miden::protocol::asset::ASSET_SIZE
 # MAST root references (v5 controller):
 #   receive_asset       0x75f638c65584d058542bcf4674b066ae394183021bc9b44dc2fdd97d52f9bcfb
 #   set_user_position   0x8d41bee5930524a81ffc0012a2505a700d2ad837a6eb395842ccd733a14423fb
+#
+# v6 read-side root (used by the accumulation read below; same root the
+# frontend uses in midenController.ts):
+#   get_user_position   0xc9ccec5458661be113ea48c9d8947d10bfe4705a53a7aeee76c273733f88bf38
 
 @locals(2048)
 proc drain_assets_into_controller
@@ -59,55 +66,100 @@ proc compute_mint_amount_from_storage
     exec.active_note::get_storage
     drop drop
 
-    push.100 mem_load                 # deposit_value
-    push.101 mem_load                 # fee_factor
-    push.102 mem_load                 # nav_scale
-    mul
-    exec.math::felt_div
+    # mint_amount = deposit_value * fee_factor / nav_scale.
+    # felt_div divides the top of the stack by the second element, so
+    # build (deposit_value * fee_factor) on top and nav_scale below it.
+    # (The previous order computed fee_factor*nav_scale / deposit_value,
+    # which credited 200000 instead of the deposited amount — only
+    # surfaced once the controller actually consumed the note.)
+    push.100 mem_load                 # deposit_value           [dv]
+    push.101 mem_load                 # fee_factor              [ff, dv]
+    mul                               # deposit_value*fee_factor [dv*ff]
+    push.102 mem_load                 # nav_scale               [ns, dv*ff]
+    swap                              # [dv*ff, ns]
+    exec.math::felt_div               # (deposit_value*fee_factor)/nav_scale
     # leave mint_amount on the top of the stack
 end
 
-# Write the user's basket-token credit into v5 controller's slot 10
-# StorageMap.
+# Accumulate the user's basket-token credit into the v5/v6 controller's
+# slot-10 StorageMap: position := current_position + mint_amount.
 #
 # Stack on entry: [mint_amount, pad...]
 # Stack on exit:  [pad (depth 16)]
 #
-# set_user_position signature:
-#   [user_basket_key_word(4), value_word(4), pad(8)] →
-#   [old_value_word(4), pad]
+# get_user_position signature (active_account::get_map_item, read-side):
+#   [user_id_suffix, user_id_prefix, 0, 0, ...] → [amount, 0, 0, 0, ...]
+# set_user_position signature (native_account::set_map_item, write-side):
+#   [user_basket_key_word(4), value_word(4), pad(8)] → [old_value(4), pad]
+#
+# NOTE the two procs read the key word in OPPOSITE stack orders
+# (different account modules). The read below mirrors the frontend's
+# get exactly ([suffix, prefix, 0, 0] top-down); the write below keeps
+# the original set sequence verbatim ([0, 0, prefix, suffix] top-down).
+# Both therefore resolve to the same map key (suffix, prefix) for the
+# same user, so the read sees what prior deposits wrote.
 proc write_user_position
-    # Read user_id felts from storage[3], storage[4].
-    push.103 mem_load                 # user_id_suffix
-    push.104 mem_load                 # user_id_prefix
-    # For now use basket_id = (0, 0) — the basket discriminator is
-    # already implicit in the controller account being targeted. M4
-    # adds a second basket field in storage for multi-basket
-    # controllers.
+    # --- read the current on-chain position for this user ---
+    # Stash mint_amount in scratch memory (mem[200], clear of the note's
+    # storage region 100..104) so the read can normalise the stack
+    # without losing it.
+    mem_store.200                      # mem[200] = mint_amount
+
+    # Read the position EXACTLY like the frontend's get + truncate_stack
+    # — a proven pattern. get_user_position and set_user_position read
+    # the key word in OPPOSITE stack orders (different account modules),
+    # so the read mirrors the frontend ([suffix, prefix, 0, 0] top-down)
+    # while the write below keeps the original set ordering; both resolve
+    # to the same (suffix, prefix) map key for this user.
+    #
+    # truncate_stack pins the depth back to 16 regardless of how many
+    # felts the FPI call left in the overflow table — without it the note
+    # script returns at depth > 16 and the kernel rejects the consume
+    # ("stack depth must be 16").
+    # Read with the SAME key word the set sequence writes below:
+    # [0, 0, prefix, suffix] (top-down). get_map_item and set_map_item
+    # take the key in the same order, so the read MUST mirror the write.
+    # (The frontend's [suffix, prefix, 0, 0] ordering targets a different
+    # key — which is why on-chain reads came back empty.)
+    push.103 mem_load                  # user_id_suffix
+    push.104 mem_load                  # user_id_prefix
+    push.0 push.0                      # [0, 0, prefix, suffix]
+    call.0xc9ccec5458661be113ea48c9d8947d10bfe4705a53a7aeee76c273733f88bf38
+    exec.sys::truncate_stack           # value word on top, depth 16
+
+    # The stored position word is [0, 0, 0, cur]; sum its 4 felts to
+    # recover cur regardless of which felt the amount sits in.
+    add add add                        # [cur_amount, ...]
+    mem_load.200                       # [mint_amount, cur_amount, ...]
+    add                                # [total, ...]
+
+    # --- write the new total back (original set sequence, verbatim) ---
+    push.103 mem_load                  # user_id_suffix
+    push.104 mem_load                  # user_id_prefix
+    # basket_id = (0, 0); discriminator is implicit in the targeted
+    # controller. M4 adds a second basket field for multi-basket.
     push.0 push.0
-    # Stack: [basket_id_prefix=0, basket_id_suffix=0,
-    #         user_id_prefix, user_id_suffix, mint_amount, pad]
+    # Stack: [0, 0, user_id_prefix, user_id_suffix, total, ...]
     # set_map_item expects the KEY word in stack-bottom order:
-    # [user_id_suffix, user_id_prefix, basket_id_suffix, basket_id_prefix, ...]
-    # Our current top is basket_id_prefix → matches.
-
-    # Build NEW_VALUE = [mint_amount, 0, 0, 0]. Already have mint_amount
-    # at stack idx 4 (after pushing 4 key felts). Move it up:
-    movup.4                            # [mint_amount, key(4), pad]
-    push.0 push.0 push.0               # [0, 0, 0, mint_amount, key(4), pad]
-    # Now stack: [value(4), key(4), pad]. set_user_position wants
-    # [key(4), value(4)] order:
-    swapw                              # [key(4), value(4), pad]
-
+    # [user_id_suffix, user_id_prefix, 0, 0, ...] → matches.
+    movup.4                            # [total, key(4), ...]
+    push.0 push.0 push.0               # [0, 0, 0, total, key(4), ...]
+    swapw                              # [key(4), value(4), ...]
     call.0xa017ac3e12d53bad11bfb8b4289a3bd2c4deef4c67a5209c53703dacbbe2d335
-    # Stack: [old_value(4), pad]
-    dropw                              # [pad]
+    # Stack: [old_value(4), ...]
+    dropw
 end
 
 begin
     exec.compute_mint_amount_from_storage
     # Stack: [mint_amount, pad]
     exec.write_user_position
-    # Stack: [pad depth 16]
     exec.drain_assets_into_controller
+    # The FPI read in write_user_position leaves a few stray felts in the
+    # overflow table that the set sequence doesn't fully clear. The note
+    # script must return at stack depth exactly 16 or the kernel rejects
+    # the consume ("stack depth must be 16"). The asset moves done by
+    # drain/receive_asset are already committed, so truncating the
+    # operand stack here is side-effect-free.
+    exec.sys::truncate_stack
 end

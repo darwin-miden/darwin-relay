@@ -205,7 +205,12 @@ async fn main() -> Result<()> {
         .map(|v| v != "0")
         .unwrap_or(true);
     let deposit_program = if use_v2_note {
+        // core_lib is attached so the v2 note can `use miden::core::sys`
+        // (truncate_stack) to normalise the stack after the FPI read in
+        // write_user_position.
         TransactionKernel::assembler()
+            .with_static_library(core_lib.as_ref())
+            .map_err(|e| anyhow::anyhow!("attach core_lib (deposit_v2): {e}"))?
             .with_static_library(math_lib.as_ref())
             .map_err(|e| anyhow::anyhow!("attach math_lib (deposit_v2): {e}"))?
             .assemble_program(ATOMIC_DEPOSIT_NOTE_V2_MASM)
@@ -696,9 +701,9 @@ async fn submit_atomic_deposit(
         deth_faucet,
         amount,
     )?)])?;
-    // Tag the note with the controller so the consumer side picks it
-    // up; same shape as flow_a_full.
-    let _ = controller; // sender is metadata-only here; controller consumes via input_notes when it picks the note up. The note carries the assets which the controller's receive_asset will absorb.
+    // Relay wallet is the note sender; the controller consumes it in
+    // step 2 below (same shape as flow_a_full), which runs the note
+    // script and credits slot-10.
     let metadata = NoteMetadata::new(relay_wallet, NoteType::Public);
 
     let mut serial_bytes = [0u8; 32];
@@ -766,21 +771,58 @@ async fn submit_atomic_deposit(
     let note = Note::new(assets, metadata, recipient);
     let note_id = note.id();
 
+    // Step 1: relay wallet emits the note carrying the dETH.
     let req = TransactionRequestBuilder::new()
         .own_output_notes(vec![note.clone()])
         .build()?;
     let result = client.execute_transaction(relay_wallet, req).await?;
     let tx_id = result.executed_transaction().id();
     let prover = client.prover();
-    let proven = client.prove_transaction_with(&result, prover).await?;
+    let proven = client.prove_transaction_with(&result, prover.clone()).await?;
     let height = client.submit_proven_transaction(proven, &result).await?;
     client.apply_transaction(&result, height).await?;
-
     info!(
         correlation_id = %intent.correlation_id,
         height = %height,
-        "atomic_deposit tx confirmed",
+        emit_tx = %tx_id,
+        "atomic_deposit note emitted (relay wallet)",
     );
+
+    // Step 2: the controller consumes the note, running the note script
+    // (receive_asset → controller vault, then accumulate slot-10) in the
+    // controller's own context. This is the step that actually credits
+    // the on-chain ledger — without it the note sits unconsumed and the
+    // frontend's on-chain position never updates. Consumed unauthenticated
+    // (the note object is passed directly), matching flow_a_full.
+    //
+    // NOTE: because write_user_position now ACCUMULATES, this consume
+    // must run exactly once per note. The caller only reaches here for
+    // intents with atomic_deposit_tx IS NULL, and persists the tx right
+    // after, so a given intent is processed once.
+    let consume_req = TransactionRequestBuilder::new()
+        .input_notes(vec![(note.clone(), None)])
+        .build()?;
+    let consume_result = client
+        .execute_transaction(controller, consume_req)
+        .await
+        .context("controller consume of atomic_deposit note")?;
+    let consume_tx_id = consume_result.executed_transaction().id();
+    let consume_proven = client
+        .prove_transaction_with(&consume_result, prover)
+        .await?;
+    let consume_height = client
+        .submit_proven_transaction(consume_proven, &consume_result)
+        .await?;
+    client
+        .apply_transaction(&consume_result, consume_height)
+        .await?;
+    info!(
+        correlation_id = %intent.correlation_id,
+        consume_tx = %consume_tx_id,
+        consume_height = %consume_height,
+        "controller consumed atomic_deposit note (slot-10 credited)",
+    );
+
     Ok((format!("{tx_id}"), format!("{note_id}")))
 }
 
