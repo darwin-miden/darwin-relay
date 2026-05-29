@@ -3,7 +3,7 @@ name = "darwin-relay"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Darwin Relay service: watches DarwinRelayDeposit.sol on ETH, bridges to a Miden operator account, mints private basket positions, mints wrapped ERC20 back to the user."
+description = "Darwin Relay v2: custodial Miden-side wallet that bridges ETH-via-1Click deposits into the v6 controller and runs the on-chain accumulating slot-10 ledger."
 repository = "https://github.com/darwin-miden/darwin-relay"
 
 [dependencies]
@@ -52,8 +52,9 @@ optional = true
 
 [features]
 default = []
-# Real Miden-client integration. Off by default so the deposit FSM
-# + MockBridge tests stay fast and self-contained.
+# Real Miden-client integration. Pulled in by v2-worker; kept as a
+# distinct feature so future read-only tooling can opt into the client
+# without dragging in the full v2 server stack.
 miden-live = [
     "dep:miden-client",
     "dep:miden-client-sqlite-store",
@@ -61,8 +62,8 @@ miden-live = [
     "dep:miden-tx",
 ]
 # v2 relay binary (Miden-side custodial wallet + 1Click listener).
-# Separate feature so the v1 binary keeps building without the new
-# HTTP server / 1Click client deps.
+# HTTP + 1Click client deps are gated so a future minimal binary can
+# opt out of axum/reqwest.
 v2 = [
     "dep:axum",
     "dep:uuid",
@@ -132,10 +133,6 @@ features         = ["json", "rustls-tls"]
 optional         = true
 
 [[bin]]
-name = "darwin_relay_service"
-path = "src/bin/darwin_relay_service.rs"
-
-[[bin]]
 name              = "darwin_relay_v2"
 path              = "src/bin/darwin_relay_v2.rs"
 required-features = ["v2"]
@@ -145,5 +142,3 @@ name              = "darwin_relay_v2_worker"
 path              = "src/bin/darwin_relay_v2_worker.rs"
 required-features = ["v2-worker"]
 
-[dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }

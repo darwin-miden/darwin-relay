@@ -4,13 +4,12 @@ A Miden-side custodial wallet that lets an ETH-native user deposit
 ETH and end up holding a Darwin basket position natively on Miden,
 without ever managing a Miden key.
 
-Three binaries live in this repo:
+Two binaries live in this repo:
 
 | Binary | Path | Role | Default port |
 |---|---|---|---|
-| `darwin_relay_v2` | `src/bin/darwin_relay_v2.rs` | **Current.** Axum REST service. Holds off-chain accounting for ETH-user intents + relay-held basket positions, brokers 1Click on the Sepolia side. | `0.0.0.0:8090` |
-| `darwin_relay_v2_worker` | `src/bin/darwin_relay_v2_worker.rs` | **On-chain leg.** Reads the same SQLite store, drives `atomic_deposit_note`, `atomic_redeem_note`, and `bridge_out_v1` submissions on Miden; polls 1Click for outbound settlement. Runs in its own process (tokio current_thread) because the miden-client futures are `!Send`. | n/a |
-| `darwin_relay_service` | `src/bin/darwin_relay_service.rs` | Historical. Sepolia escrow + wDCC wrapped-ERC20 path from M2. Kept buildable for reference; no longer wired into the frontend. | n/a |
+| `darwin_relay_v2` | `src/bin/darwin_relay_v2.rs` | Axum REST service. Holds off-chain accounting for ETH-user intents + relay-held basket positions, brokers 1Click on the Sepolia side. | `0.0.0.0:8090` |
+| `darwin_relay_v2_worker` | `src/bin/darwin_relay_v2_worker.rs` | On-chain leg. Reads the same SQLite store, drives `atomic_deposit_note` (emit + controller-consume → slot-10 accumulation), `atomic_redeem_note`, and `bridge_out_v1` submissions on Miden; polls 1Click for outbound settlement. Runs in its own process (tokio current_thread) because the miden-client futures are `!Send`. | n/a |
 
 The v2 design is described in [`SPEC-v2.md`](SPEC-v2.md). Why the
 reshape: the original v1 collapsed three roles (bridge, relay wallet,
@@ -120,13 +119,6 @@ Two scripts in `scripts/`:
 Both expect `darwin_relay_v2` on `:8090`, the 1Click mock on `:8080`,
 `cast` on `$PATH`, and `DARWIN_DEV_KEY` exported. `v2_worker_full.sh`
 additionally needs `darwin_relay_v2_worker` running in another shell.
-
-## v1 — historical
-
-The v1 ETH-side escrow contract `DarwinRelayDeposit.sol` and the
-v1 binary `darwin_relay_service` are preserved for reference. See
-the git history before commit `e620dd6` for the v1 architecture
-notes that previously occupied this file.
 
 ## License
 
