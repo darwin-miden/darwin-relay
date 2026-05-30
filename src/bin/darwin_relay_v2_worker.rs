@@ -113,19 +113,24 @@ fn tunables() -> &'static Tunables {
 const DEFAULT_CONTROLLER_HEX: &str = "0x2a3ea0a268d97b80497d6a966e3141";
 // Miden testnet dETH faucet (the M1 deth-equivalent fungible faucet
 // the basket controllers know about). The 1Click bridge mints
-// `miden-testnet:eth` from a different faucet; for the deposit path
-// to work, the relay wallet must hold dETH from a faucet the basket
-// controller's `receive_asset` recognises. In M4 we'll route
-// 1Click's eth-faucet output through a swap, but for the M3 demo
-// the worker reads whichever fungible asset the relay holds — same
-// dynamic-discovery pattern as flow_c_full.
-const DEFAULT_DETH_FAUCET_HEX: &str = "0xa095d9b3831e96206ff70c2218a6a9";
+// `miden-testnet:eth` from a single faucet at runtime — the relay
+// vault snapshot during deposit processing must check the balance
+// under THAT faucet id, otherwise it reads a stale residual from an
+// earlier faucet generation and refuses to credit any deposit.
+//
+// Source-of-truth = the live `faucet_account_id` field on the
+// bridge's `submitting Miden pay-to-id mint` log lines. Override via
+// env var when the bridge instance re-rolls (fresh seed → fresh
+// faucet account → this hardcoded value goes stale).
+const DEFAULT_DETH_FAUCET_HEX: &str = "0xf45bad08699050a02d5db52d4e1c28";
 
 // 1Click bridge's miden-testnet:eth faucet — what the bridge mints
 // inbound and what it expects on outbound. The relay vault must hold
 // this faucet's tokens for the outbound P2ID leg to actually carry
-// usable assets. Configurable via env.
-const DEFAULT_ONECLICK_FAUCET_HEX: &str = "0x7aabde381e7ac6a06b22534a6900cb";
+// usable assets. Same caveat as DEFAULT_DETH_FAUCET_HEX above:
+// regenerated when the bridge container is reseeded, so re-pin via
+// env on faucet drift.
+const DEFAULT_ONECLICK_FAUCET_HEX: &str = "0xf45bad08699050a02d5db52d4e1c28";
 const DEFAULT_ONECLICK_URL: &str = "http://localhost:8080";
 
 // Canonical Bali AggLayer (gateway-fm) — used by the B2AGG outbound
