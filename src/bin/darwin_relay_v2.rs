@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
     routing::{get, post},
@@ -109,6 +109,16 @@ CREATE TABLE IF NOT EXISTS redemptions (
     updated_at            INTEGER NOT NULL
 );
 
+-- Worker heartbeat — the worker writes one row per binary at the end
+-- of every tick; REST reads from /v0/worker-health so operators can
+-- detect a stuck worker without log scraping. Single row per worker_id
+-- (typically just "main" since there's exactly one worker process).
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
+    worker_id        TEXT PRIMARY KEY,
+    last_tick_at     INTEGER NOT NULL,
+    last_tick_status TEXT NOT NULL
+);
+
 -- Direct canonical Bali outbound requests (no basket position
 -- involved). REST writes the row; the worker drains, builds a
 -- B2AggNote from the relay vault toward dest_address, and writes
@@ -131,6 +141,22 @@ CREATE TABLE IF NOT EXISTS pending_bridge_outs (
 // existing databases.
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE redemptions ADD COLUMN miden_redeem_tx TEXT",
+    // Split the legacy `oneclick_correlation` joint-by-pipe ('<id>|<addr>')
+    // into two well-typed columns. Reads consume the new columns
+    // (NULL = pure canonical B2AGG, populated = legacy 1Click mock
+    // path). Legacy column is still written for backward compat
+    // during the cutover.
+    "ALTER TABLE redemptions ADD COLUMN oneclick_correlation_id TEXT",
+    "ALTER TABLE redemptions ADD COLUMN oneclick_deposit_address TEXT",
+    // One-shot backfill of pre-split rows. Idempotent via the
+    // `oneclick_correlation_id IS NULL` guard so future startups
+    // don't clobber freshly-written values.
+    r#"UPDATE redemptions
+          SET oneclick_correlation_id  = NULLIF(SUBSTR(oneclick_correlation, 1, INSTR(oneclick_correlation, '|') - 1), ''),
+              oneclick_deposit_address = NULLIF(SUBSTR(oneclick_correlation, INSTR(oneclick_correlation, '|') + 1), '')
+        WHERE oneclick_correlation_id IS NULL
+          AND oneclick_correlation IS NOT NULL
+          AND INSTR(oneclick_correlation, '|') > 0"#,
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -394,8 +420,14 @@ fn credit_position(
 #[derive(Debug, Clone)]
 struct AppConfig {
     relay_miden_address: String,
-    controller_hex: String,
     oneclick_url: String,
+    // Tunables — read once at startup from env, default to the values
+    // that shipped with M3. Surfacing them here keeps the magic numbers
+    // out of the call sites and makes M4 fee changes a config flip
+    // instead of a code change.
+    wei_per_miden_base: u128,  // EVM 18-dec → Miden 8-dec base unit
+    intent_expiry_s: i64,      // /v0/intents expires_at offset
+    list_limit: usize,         // /v0/redemptions/:addr default LIMIT
 }
 
 struct AppState {
@@ -421,13 +453,26 @@ async fn create_intent(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateIntentReq>,
 ) -> Result<Json<CreateIntentResp>, (StatusCode, Json<Value>)> {
+    let user = body.user_evm_addr.trim().to_lowercase();
+    let symbol = body.basket_symbol.trim().to_uppercase();
+    let amount_wei = body.amount_in_wei.trim().to_string();
+    if !is_valid_evm_addr(&user) {
+        return Err(bad_request("user_evm_addr must be 0x + 40 hex"));
+    }
+    if !is_known_basket(&symbol) {
+        return Err(bad_request("basket_symbol must be one of DCC, DAG, DCO, DPP"));
+    }
+    if !is_positive_u128(&amount_wei) {
+        return Err(bad_request("amount_in_wei must be a positive integer string"));
+    }
+
     let cid = Uuid::new_v4().to_string();
     let now = now_unix();
     let intent = Intent {
         correlation_id: cid.clone(),
-        user_evm_addr: body.user_evm_addr.to_lowercase(),
-        basket_symbol: body.basket_symbol.to_uppercase(),
-        amount_in_wei: body.amount_in_wei,
+        user_evm_addr: user,
+        basket_symbol: symbol,
+        amount_in_wei: amount_wei,
         deposit_address: None,
         sepolia_tx: None,
         stage: "QUOTED".to_string(),
@@ -446,7 +491,7 @@ async fn create_intent(
     Ok(Json(CreateIntentResp {
         correlation_id: cid,
         relay_miden_address: state.cfg.relay_miden_address.clone(),
-        expires_at: now + 3600,
+        expires_at: now + state.cfg.intent_expiry_s,
     }))
 }
 
@@ -475,6 +520,14 @@ async fn attach_deposit(
     Path(correlation_id): Path<String>,
     Json(body): Json<AttachDepositReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let deposit_address = body.deposit_address.trim().to_string();
+    let sepolia_tx = body.sepolia_tx.trim().to_string();
+    if !is_valid_evm_addr(&deposit_address) {
+        return Err(bad_request("deposit_address must be 0x + 40 hex"));
+    }
+    if !is_valid_tx_hash(&sepolia_tx) {
+        return Err(bad_request("sepolia_tx must be 0x + 64 hex"));
+    }
     let db = state.db.lock().await;
     let mut i = match load_intent(&db, &correlation_id).map_err(internal_err)? {
         Some(i) => i,
@@ -485,8 +538,8 @@ async fn attach_deposit(
             ))
         }
     };
-    i.deposit_address = Some(body.deposit_address);
-    i.sepolia_tx = Some(body.sepolia_tx);
+    i.deposit_address = Some(deposit_address);
+    i.sepolia_tx = Some(sepolia_tx);
     if i.stage == "QUOTED" {
         i.stage = "KNOWN_DEPOSIT_TX".to_string();
     }
@@ -506,15 +559,19 @@ async fn redeem(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RedeemReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let user = body.user_evm_addr.to_lowercase();
-    let symbol = body.basket_symbol.to_uppercase();
-    let amount: u128 = body
-        .basket_amount
-        .parse()
-        .map_err(|_| (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "basket_amount must be a u128 string" })),
-        ))?;
+    let user = body.user_evm_addr.trim().to_lowercase();
+    let symbol = body.basket_symbol.trim().to_uppercase();
+    let basket_amount_str = body.basket_amount.trim().to_string();
+    if !is_valid_evm_addr(&user) {
+        return Err(bad_request("user_evm_addr must be 0x + 40 hex"));
+    }
+    if !is_known_basket(&symbol) {
+        return Err(bad_request("basket_symbol must be one of DCC, DAG, DCO, DPP"));
+    }
+    if !is_positive_u128(&basket_amount_str) {
+        return Err(bad_request("basket_amount must be a positive integer string"));
+    }
+    let amount: u128 = basket_amount_str.parse().expect("checked by is_positive_u128");
 
     let rid = Uuid::new_v4().to_string();
     let now = now_unix();
@@ -602,26 +659,53 @@ async fn get_redemption(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ListRedemptionsQuery {
+    /// created_at (unix-seconds) ceiling. Returns rows where
+    /// `created_at < cursor`. Together with the page's last row's
+    /// created_at, lets the client walk the history with stable
+    /// ordering even when new redemptions land at the head.
+    cursor: Option<i64>,
+    /// page size override, clamped to [1, list_limit].
+    limit: Option<usize>,
+}
+
 async fn list_redemptions_for_user(
     State(state): State<Arc<AppState>>,
     Path(user_evm_addr): Path<String>,
+    Query(q): Query<ListRedemptionsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let user_lower = user_evm_addr.to_lowercase();
+    let limit = q
+        .limit
+        .unwrap_or(state.cfg.list_limit)
+        .clamp(1, state.cfg.list_limit);
+    // i64::MAX as default = "no ceiling" (= first page). Subsequent
+    // calls pass the previous page's last created_at as the cursor.
+    let cursor = q.cursor.unwrap_or(i64::MAX);
     let db = state.db.lock().await;
-    let mut stmt = db
-        .prepare(
-            r#"SELECT redemption_id, user_evm_addr, basket_symbol, basket_amount, stage,
-                      oneclick_correlation, miden_redeem_tx, miden_bridge_out_tx,
-                      sepolia_release_tx, error, created_at, updated_at
-                  FROM redemptions
-                  WHERE user_evm_addr = ?1
-                  ORDER BY created_at DESC
-                  LIMIT 50"#,
-        )
+    // LIMIT is interpolated (sqlite won't bind it). Both interpolated
+    // values are typed integers, so no SQL injection surface.
+    let sql = format!(
+        r#"SELECT redemption_id, user_evm_addr, basket_symbol, basket_amount, stage,
+                  oneclick_correlation, miden_redeem_tx, miden_bridge_out_tx,
+                  sepolia_release_tx, error, created_at, updated_at
+              FROM redemptions
+              WHERE user_evm_addr = ?1
+                AND created_at    < ?2
+              ORDER BY created_at DESC
+              LIMIT {}"#,
+        limit,
+    );
+    let mut stmt = db.prepare(&sql).map_err(internal_err)?;
+    let mut rows = stmt
+        .query(params![user_lower, cursor])
         .map_err(internal_err)?;
-    let mut rows = stmt.query(params![user_lower]).map_err(internal_err)?;
     let mut out: Vec<Value> = Vec::new();
+    let mut last_created_at: Option<i64> = None;
     while let Some(r) = rows.next().map_err(internal_err)? {
+        let created_at = r.get::<_, i64>(10).map_err(internal_err)?;
+        last_created_at = Some(created_at);
         out.push(json!({
             "redemption_id":         r.get::<_, String>(0).map_err(internal_err)?,
             "user_evm_addr":         r.get::<_, String>(1).map_err(internal_err)?,
@@ -633,11 +717,20 @@ async fn list_redemptions_for_user(
             "miden_bridge_out_tx":   r.get::<_, Option<String>>(7).map_err(internal_err)?,
             "sepolia_release_tx":    r.get::<_, Option<String>>(8).map_err(internal_err)?,
             "error":                 r.get::<_, Option<String>>(9).map_err(internal_err)?,
-            "created_at":            r.get::<_, i64>(10).map_err(internal_err)?,
+            "created_at":            created_at,
             "updated_at":            r.get::<_, i64>(11).map_err(internal_err)?,
         }));
     }
-    Ok(Json(json!({ "user": user_lower, "redemptions": out })))
+    // `next_cursor` = the smallest created_at on this page. When the
+    // page came back shorter than `limit`, there's no more history and
+    // we return null so the client can stop polling.
+    let next_cursor = if out.len() == limit { last_created_at } else { None };
+    Ok(Json(json!({
+        "user":        user_lower,
+        "redemptions": out,
+        "next_cursor": next_cursor,
+        "limit":       limit,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -767,6 +860,53 @@ async fn get_bridge_out(
     }
 }
 
+async fn worker_health(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let db = state.db.lock().await;
+    let row = db
+        .query_row(
+            r#"SELECT worker_id, last_tick_at, last_tick_status
+                  FROM worker_heartbeats
+                  WHERE worker_id = 'main'"#,
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(internal_err)?;
+
+    match row {
+        Some((worker_id, last_tick_at, last_tick_status)) => {
+            let lag_s = now_unix() - last_tick_at;
+            // ~3x the worker poll interval is the reasonable health
+            // ceiling. The worker default is 30s ; default ceiling
+            // 90s. Surfaces a clear `ok: false` so an upstream probe
+            // can alert on it.
+            let ok = lag_s <= 90 && last_tick_status == "ok";
+            Ok(Json(json!({
+                "ok":               ok,
+                "worker_id":        worker_id,
+                "last_tick_at":     last_tick_at,
+                "last_tick_lag_s":  lag_s,
+                "last_tick_status": last_tick_status,
+            })))
+        }
+        None => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "ok":    false,
+                "error": "no worker heartbeat recorded — worker hasn't ticked yet or store is wrong",
+            })),
+        )),
+    }
+}
+
 async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "service": "darwin-relay-v2" }))
 }
@@ -852,14 +992,50 @@ fn internal_err(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     )
 }
 
+fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": msg.into() })),
+    )
+}
+
+// 0x + 40 ASCII hex chars. Same check as `/v0/bridge-out` so every
+// REST entry point accepts the same address shape — no silent
+// downstream surprises from a malformed EVM address persisted as-is.
+fn is_valid_evm_addr(s: &str) -> bool {
+    s.len() == 42
+        && s.starts_with("0x")
+        && s[2..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+// Sepolia / Ethereum tx hash: 0x + 64 hex chars.
+fn is_valid_tx_hash(s: &str) -> bool {
+    s.len() == 66
+        && s.starts_with("0x")
+        && s[2..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+// Positive integer string, parseable as u128. Stored as TEXT in
+// sqlite but every consumer re-parses to u64/u128 — reject the bad
+// shape at the door instead of letting it land in the ledger.
+fn is_positive_u128(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_digit())
+        && s.parse::<u128>().map(|n| n > 0).unwrap_or(false)
+}
+
+// M3 baskets only (matches lib/baskets.ts on the frontend). New
+// baskets land here as they ship.
+fn is_known_basket(s: &str) -> bool {
+    matches!(s, "DCC" | "DAG" | "DCO" | "DPP")
+}
+
 // ---------------------------------------------------------------------------
 // 1Click client
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 struct OneClickStatus {
-    #[serde(rename = "correlationId")]
-    _correlation_id: String,
     status: String,
     #[serde(rename = "swapDetails", default)]
     swap_details: Option<OneClickSwapDetails>,
@@ -952,11 +1128,11 @@ async fn poll_one_intent(state: &Arc<AppState>, mut intent: Intent) -> Result<()
             // portfolio panels diverge by 10 orders of magnitude.
             // 1:1 USD-equivalent at par for the M3 demo; M4 reads live
             // Pragma + applies pro-rata across constituents.
-            const WEI_PER_MIDEN_BASE: u128 = 10_000_000_000; // 18-dec → 8-dec
+            let wei_per_miden_base = state.cfg.wei_per_miden_base;
             let basket_amount = intent
                 .amount_in_wei
                 .parse::<u128>()
-                .map(|wei| (wei / WEI_PER_MIDEN_BASE).max(1).to_string())
+                .map(|wei| (wei / wei_per_miden_base).max(1).to_string())
                 .unwrap_or_else(|_| intent.amount_in_wei.clone());
             intent.basket_amount_minted = Some(basket_amount.clone());
             let db = state.db.lock().await;
@@ -1057,8 +1233,12 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "http://localhost:8080".to_string());
     let relay_miden_address = std::env::var("DARWIN_RELAY_V2_RELAY_WALLET_HEX")
         .unwrap_or_else(|_| "0xed3cd5befa3207805f8529207cfc0d".to_string());
+    // v6 fee-routing controller — strict superset of v5. Must match
+    // the worker's DEFAULT_CONTROLLER_HEX or env var or the two sides
+    // target different accounts and the on-chain slot-10 ledger never
+    // updates.
     let controller_hex = std::env::var("DARWIN_RELAY_V2_CONTROLLER_HEX")
-        .unwrap_or_else(|_| "0xa25aa0b00007688024b74b05a52aab".to_string());
+        .unwrap_or_else(|_| "0x2a3ea0a268d97b80497d6a966e3141".to_string());
     let poll_interval_s: u64 = std::env::var("DARWIN_RELAY_V2_POLL_INTERVAL_S")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1080,11 +1260,35 @@ async fn main() -> Result<()> {
         }
     }
 
+    let wei_per_miden_base: u128 = std::env::var("DARWIN_RELAY_V2_WEI_PER_MIDEN_BASE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000_000_000);
+    let intent_expiry_s: i64 = std::env::var("DARWIN_RELAY_V2_INTENT_EXPIRY_S")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3600);
+    let list_limit: usize = std::env::var("DARWIN_RELAY_V2_LIST_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+
     let cfg = AppConfig {
         relay_miden_address,
-        controller_hex,
         oneclick_url,
+        wei_per_miden_base,
+        intent_expiry_s,
+        list_limit,
     };
+    info!(
+        wei_per_miden_base,
+        intent_expiry_s,
+        list_limit,
+        "tunables loaded",
+    );
+    // controller_hex is logged for ops visibility but the REST handlers
+    // never use it — the worker is what submits against the controller.
+    let _ = controller_hex;
     let state = Arc::new(AppState {
         db: Mutex::new(conn),
         cfg,
@@ -1110,6 +1314,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/v0/worker-health", get(worker_health))
         .route("/metrics", get(metrics))
         .route("/v0/intents", post(create_intent))
         .route("/v0/intents/:correlation_id", get(get_intent))

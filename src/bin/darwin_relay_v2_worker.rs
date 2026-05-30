@@ -63,6 +63,48 @@ const MATH_MASM: &str = include_str!("../../asm/lib/math.masm");
 const BRIDGE_OUT_V1_MASM: &str = include_str!("../../asm/bridge_out_v1.masm");
 
 const DEFAULT_RELAY_WALLET_HEX: &str = "0xed3cd5befa3207805f8529207cfc0d";
+
+// Tunables read once from env at first access. Magic numbers that
+// used to be scattered through the call sites (decimal scaling, fee
+// factor, redeem-fee net basis points) live here so M4 fee changes
+// or non-1:1 USD pegs are a config flip, not a code change. Defaults
+// match what shipped with M3.
+struct Tunables {
+    /// EVM 18-dec → Miden 8-dec base unit (default 10^10).
+    wei_per_miden_base: u128,
+    /// fee_factor felt for atomic_deposit_note_v2 (default 10_000).
+    fee_factor: u64,
+    /// 1 - redeem_fee in 10_000ths. Default 9_970 = 30 bps redeem fee.
+    /// Used by the outbound legs to compute the released-underlying
+    /// amount, and by the status poller to match Bali claims to
+    /// in-flight redemptions.
+    redeem_fee_net_bps: u64,
+}
+
+fn tunables() -> &'static Tunables {
+    use std::sync::OnceLock;
+    static T: OnceLock<Tunables> = OnceLock::new();
+    T.get_or_init(|| {
+        let t = Tunables {
+            wei_per_miden_base: std::env::var("DARWIN_RELAY_V2_WEI_PER_MIDEN_BASE")
+                .ok().and_then(|s| s.parse().ok())
+                .unwrap_or(10_000_000_000),
+            fee_factor: std::env::var("DARWIN_RELAY_V2_FEE_FACTOR")
+                .ok().and_then(|s| s.parse().ok())
+                .unwrap_or(10_000),
+            redeem_fee_net_bps: std::env::var("DARWIN_RELAY_V2_REDEEM_FEE_NET_BPS")
+                .ok().and_then(|s| s.parse().ok())
+                .unwrap_or(9_970),
+        };
+        info!(
+            wei_per_miden_base = t.wei_per_miden_base,
+            fee_factor = t.fee_factor,
+            redeem_fee_net_bps = t.redeem_fee_net_bps,
+            "tunables loaded",
+        );
+        t
+    })
+}
 // v6 controller — deployed 2026-05-26, strict superset of v5 (adds
 // slot 11 fee_recipient + receive_and_credit). For the notes this
 // worker emits (receive_asset + set_user_position), the MAST roots
@@ -242,7 +284,7 @@ async fn main() -> Result<()> {
     let redeem_script = NoteScript::new(redeem_program);
 
     loop {
-        if let Err(e) = tick(
+        let tick_result = tick(
             &mut client,
             &store_path,
             relay_wallet,
@@ -259,12 +301,40 @@ async fn main() -> Result<()> {
             &redeem_script,
             &bridge_out_script,
         )
-        .await
-        {
-            error!(error = %e, "tick failed");
+        .await;
+
+        let status = match &tick_result {
+            Ok(()) => "ok".to_string(),
+            Err(e) => {
+                error!(error = %e, "tick failed");
+                // First 200 chars of the error so /v0/worker-health can
+                // surface it without a log scrape.
+                let s = format!("{e:?}");
+                if s.len() > 200 { format!("{}…", &s[..200]) } else { s }
+            }
+        };
+        if let Err(e) = write_heartbeat(&store_path, "main", &status) {
+            warn!(error = %e, "heartbeat write failed");
         }
+
         tokio::time::sleep(Duration::from_secs(poll_interval_s)).await;
     }
+}
+
+fn write_heartbeat(store_path: &str, worker_id: &str, status: &str) -> Result<()> {
+    let conn = Connection::open(store_path)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    conn.execute(
+        r#"INSERT INTO worker_heartbeats (worker_id, last_tick_at, last_tick_status)
+              VALUES (?1, ?2, ?3)
+              ON CONFLICT(worker_id) DO UPDATE SET
+                 last_tick_at     = excluded.last_tick_at,
+                 last_tick_status = excluded.last_tick_status"#,
+        params![worker_id, now, status],
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -531,8 +601,8 @@ async fn process_deposits(
         // backed. Map wei → 8-dec faucet base units (÷10^10): a
         // 0.00001 ETH deposit (1e13 wei) becomes 1000 dETH base units,
         // which fits both the faucet supply and the relay's holdings.
-        const WEI_PER_MIDEN_BASE: u128 = 10_000_000_000; // 18-dec → 8-dec
-        let amount: u64 = u64::try_from((amount_wei / WEI_PER_MIDEN_BASE).max(1))
+        let wei_per_miden_base = tunables().wei_per_miden_base;
+        let amount: u64 = u64::try_from((amount_wei / wei_per_miden_base).max(1))
             .unwrap_or(u64::MAX);
         if vault_balance < amount {
             info!(
@@ -747,11 +817,11 @@ async fn submit_atomic_deposit(
     // 9970 regardless of deposit size — which is what diverged from
     // the off-chain ledger.) The 30 bps redeem fee is applied on the
     // redeem leg, not here.
-    const FEE_FACTOR: u64 = 10_000;
-    let nav_scale: u64 = FEE_FACTOR;
+    let fee_factor = tunables().fee_factor;
+    let nav_scale = fee_factor;
     let mut storage_felts = vec![
         miden_client::Felt::new(amount),
-        miden_client::Felt::new(FEE_FACTOR),
+        miden_client::Felt::new(fee_factor),
         miden_client::Felt::new(nav_scale),
     ];
     if std::env::var("DARWIN_RELAY_V2_USE_V2_NOTE")
@@ -876,10 +946,10 @@ async fn submit_atomic_redeem(
 
     // Storage felts per atomic_redeem_note.masm:
     //   [burn_amount, gross_release_factor, scale]
-    // Same shape as flow_c_full: 9970 = 99.7% net of 30 bps redeem fee.
+    // 9970/10000 = 99.7% net of the 30 bps redeem fee (env-tunable).
     let storage_felts = vec![
         miden_client::Felt::new(amount),
-        miden_client::Felt::new(9_970),
+        miden_client::Felt::new(tunables().redeem_fee_net_bps),
         miden_client::Felt::new(1),
     ];
     let recipient = NoteRecipient::new(
@@ -1039,7 +1109,7 @@ async fn process_outbound(
         };
         // 99.7% net of 30 bps redeem fee, matching the on-chain note's
         // gross_release_factor. M4 routes through Pragma + pro-rata.
-        let underlying = basket_amount.saturating_mul(9_970) / 10_000;
+        let underlying = basket_amount.saturating_mul(tunables().redeem_fee_net_bps) / 10_000;
 
         if vault_balance < underlying {
             info!(
@@ -1374,23 +1444,6 @@ fn hex_to_evm(s: &str) -> Option<[u8; 20]> {
     Some(out)
 }
 
-fn parse_miden_account(s: &str) -> Result<AccountId> {
-    let trimmed = s.trim();
-    // Miden bech32 in some contexts (e.g. the relay tooling, the 1Click
-    // mock) is suffixed with `_qr7qqq9wr6w` — a separate group encoding
-    // the account-id-suffix that the bech32 part doesn't carry. The
-    // canonical AccountId::from_bech32 only accepts the underscore-less
-    // form, so strip the suffix before trying.
-    let canonical = trimmed.split_once('_').map(|(a, _)| a).unwrap_or(trimmed);
-    if canonical.starts_with("mtst1") || canonical.starts_with("mm1") {
-        let (_net, id) = AccountId::from_bech32(canonical)
-            .map_err(|e| anyhow::anyhow!("bech32 decode of {canonical:?}: {e}"))?;
-        Ok(id)
-    } else {
-        AccountId::from_hex(canonical).map_err(|e| anyhow::anyhow!("hex decode of {canonical:?}: {e}"))
-    }
-}
-
 fn urlencode(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -1407,23 +1460,18 @@ fn urlencode(s: &str) -> String {
 struct PendingIntent {
     correlation_id: String,
     user_evm_addr: String,
-    basket_symbol: String,
     amount_in_wei: String,
 }
 
 struct PendingRedemption {
     redemption_id: String,
-    #[allow(dead_code)]
-    user_evm_addr: String,
-    #[allow(dead_code)]
-    basket_symbol: String,
     basket_amount: String,
 }
 
 fn load_pending_intents(store_path: &str) -> Result<Vec<PendingIntent>> {
     let conn = Connection::open(store_path)?;
     let mut stmt = conn.prepare(
-        r#"SELECT correlation_id, user_evm_addr, basket_symbol, amount_in_wei
+        r#"SELECT correlation_id, user_evm_addr, amount_in_wei
               FROM intents
               WHERE stage = 'POSITION_CREDITED'
                 AND atomic_deposit_tx IS NULL
@@ -1435,8 +1483,7 @@ fn load_pending_intents(store_path: &str) -> Result<Vec<PendingIntent>> {
         out.push(PendingIntent {
             correlation_id: r.get(0)?,
             user_evm_addr: r.get(1)?,
-            basket_symbol: r.get(2)?,
-            amount_in_wei: r.get(3)?,
+            amount_in_wei: r.get(2)?,
         });
     }
     Ok(out)
@@ -1485,7 +1532,7 @@ fn mark_intent_error(
 fn load_pending_redemptions(store_path: &str) -> Result<Vec<PendingRedemption>> {
     let conn = Connection::open(store_path)?;
     let mut stmt = conn.prepare(
-        r#"SELECT redemption_id, user_evm_addr, basket_symbol, basket_amount
+        r#"SELECT redemption_id, basket_amount
               FROM redemptions
               WHERE miden_redeem_tx IS NULL
                 AND (error IS NULL OR error = '')
@@ -1496,9 +1543,7 @@ fn load_pending_redemptions(store_path: &str) -> Result<Vec<PendingRedemption>> 
     while let Some(r) = rows.next()? {
         out.push(PendingRedemption {
             redemption_id: r.get(0)?,
-            user_evm_addr: r.get(1)?,
-            basket_symbol: r.get(2)?,
-            basket_amount: r.get(3)?,
+            basket_amount: r.get(1)?,
         });
     }
     Ok(out)
@@ -1538,6 +1583,72 @@ fn mark_redemption_error(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
+
+    // Auto-recovery: the REST handler debits the user's position
+    // BEFORE the worker emits anything on-chain (the redemption stage
+    // is flipped to SETTLED immediately so the UI reflects intent).
+    // If the worker then permanently fails to emit, the off-chain
+    // debit would otherwise be unrecoverable. Re-credit the position
+    // on the FIRST error mark so the user is whole.
+    //
+    // Idempotency: only re-credit when the existing error column is
+    // NULL. A second call to mark_redemption_error (later retries by
+    // the worker after the error was already recorded) only updates
+    // the error message.
+    let row = conn
+        .query_row(
+            r#"SELECT error IS NULL AS first_time,
+                      user_evm_addr,
+                      basket_symbol,
+                      basket_amount
+                  FROM redemptions
+                  WHERE redemption_id = ?1"#,
+            params![redemption_id],
+            |r| {
+                Ok((
+                    r.get::<_, bool>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .ok();
+
+    if let Some((first_time, user, symbol, amount)) = row {
+        if first_time {
+            // Same upsert shape REST's credit_position uses — adds the
+            // amount back, stamps a recovery marker as the
+            // last_correlation_id so an operator can trace the credit
+            // back to the originating redemption.
+            conn.execute(
+                r#"INSERT INTO positions
+                      (user_evm_addr, basket_symbol, basket_amount,
+                       last_correlation_id, last_updated)
+                    VALUES (?1, ?2, ?3, ?4, ?5)
+                    ON CONFLICT(user_evm_addr, basket_symbol) DO UPDATE SET
+                       basket_amount       = CAST(CAST(basket_amount AS INTEGER)
+                                                 + CAST(excluded.basket_amount AS INTEGER) AS TEXT),
+                       last_correlation_id = excluded.last_correlation_id,
+                       last_updated        = excluded.last_updated"#,
+                params![
+                    user,
+                    symbol,
+                    amount,
+                    format!("recovery-of-{}", redemption_id),
+                    now,
+                ],
+            )?;
+            info!(
+                redemption_id = %redemption_id,
+                user = %user,
+                basket = %symbol,
+                amount = %amount,
+                "auto-recovered: redemption errored → position re-credited",
+            );
+        }
+    }
+
     conn.execute(
         r#"UPDATE redemptions
               SET error      = ?2,
@@ -1600,7 +1711,7 @@ async fn process_outbound_b2agg(
         };
         // Same 30 bps redeem-fee net the legacy path applied. M4 will
         // route through Pragma + per-constituent pro-rata.
-        let underlying = basket_amount.saturating_mul(9_970) / 10_000;
+        let underlying = basket_amount.saturating_mul(tunables().redeem_fee_net_bps) / 10_000;
 
         if vault_balance < underlying {
             info!(
@@ -2013,24 +2124,32 @@ async fn process_outbound_status_b2agg(
     http: &reqwest::Client,
 ) -> Result<()> {
     let conn = Connection::open(relay_store_path)?;
-    // Only poll b2agg-mode outbounds. Legacy bridge_out_v1 (Brian's
-    // 1Click mock) entries have a non-empty oneclick_correlation
-    // ('<correlation_id>|<deposit_address>'); b2agg entries get
-    // mark_redemption_outbound called with two empty strings → the
-    // joined value is just the separator '|'. Filtering on that
-    // prevents the poller from cross-matching old 1Click redemptions
-    // against new canonical Bali outbounds when their amounts collide.
+    // Only poll b2agg-mode outbounds: oneclick_correlation_id IS NULL
+    // means "canonical Bali" (no 1Click correlation was attached).
+    // Legacy bridge_out_v1 (1Click mock) entries have it set. The
+    // typed column is the post-split shape; old rows are backfilled
+    // by the startup migration so the NULL check is consistent across
+    // history.
+    // AggLayer certs settle in 30-90 min, so polling Bali for
+    // redemptions younger than ~25 min is just generating load —
+    // the answer is guaranteed to be "not yet". Skip them; they'll
+    // be picked up on a later tick.
+    let earliest_settleable = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64
+        - 1500; // 25 minutes
     let mut stmt = conn.prepare(
         r#"SELECT redemption_id, user_evm_addr, basket_amount
               FROM redemptions
               WHERE miden_bridge_out_tx IS NOT NULL
                 AND (sepolia_release_tx IS NULL OR sepolia_release_tx = '')
                 AND (error IS NULL OR error = '')
-                AND (oneclick_correlation = '|' OR oneclick_correlation IS NULL OR oneclick_correlation = '')
+                AND oneclick_correlation_id IS NULL
+                AND created_at <= ?1
               ORDER BY created_at ASC"#,
     )?;
     let rows = stmt
-        .query_map(params![], |r| {
+        .query_map(params![earliest_settleable], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -2057,8 +2176,9 @@ async fn process_outbound_status_b2agg(
         // (18-decimal). The 10^10 factor closes the decimal gap
         // between Miden's 8-dec faucet representation and Sepolia's
         // 18-dec ETH wei representation.
-        let expected_underlying_miden = basket_amount_u64.saturating_mul(9_970) / 10_000;
-        let expected_underlying_wei = expected_underlying_miden.saturating_mul(10_000_000_000);
+        let t = tunables();
+        let expected_underlying_miden = basket_amount_u64.saturating_mul(t.redeem_fee_net_bps) / 10_000;
+        let expected_underlying_wei = expected_underlying_miden.saturating_mul(t.wei_per_miden_base as u64);
 
         let url = format!(
             "{}/api/bridges/{}",
@@ -2189,17 +2309,22 @@ fn mark_redemption_outbound(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
-    // oneclick_correlation stores BOTH the 1Click correlationId and
-    // the Miden deposit address it returned, joined by `|`. The status
-    // poller splits this back out — keeps the schema unchanged.
+    // Two columns now hold what the legacy `oneclick_correlation`
+    // joint-by-pipe used to encode. The pipe-joined column is still
+    // written for backward compat (older readers / dashboards), but
+    // every new code path reads from the typed columns.
     let joined = format!("{correlation_id}|{deposit_address}");
+    let cid = if correlation_id.is_empty() { None } else { Some(correlation_id) };
+    let dep = if deposit_address.is_empty() { None } else { Some(deposit_address) };
     conn.execute(
         r#"UPDATE redemptions
-              SET miden_bridge_out_tx  = ?2,
-                  oneclick_correlation = ?3,
-                  updated_at           = ?4
+              SET miden_bridge_out_tx        = ?2,
+                  oneclick_correlation       = ?3,
+                  oneclick_correlation_id    = ?4,
+                  oneclick_deposit_address   = ?5,
+                  updated_at                 = ?6
               WHERE redemption_id = ?1"#,
-        params![redemption_id, tx_hex, joined, now],
+        params![redemption_id, tx_hex, joined, cid, dep, now],
     )?;
     Ok(())
 }
