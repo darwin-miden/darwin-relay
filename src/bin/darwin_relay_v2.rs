@@ -57,7 +57,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -107,6 +107,22 @@ CREATE TABLE IF NOT EXISTS redemptions (
     error                 TEXT,
     created_at            INTEGER NOT NULL,
     updated_at            INTEGER NOT NULL
+);
+
+-- Direct canonical Bali outbound requests (no basket position
+-- involved). REST writes the row; the worker drains, builds a
+-- B2AggNote from the relay vault toward dest_address, and writes
+-- the Miden tx id back. The frontend's BaliWithdrawPanel polls the
+-- GET endpoint for status.
+CREATE TABLE IF NOT EXISTS pending_bridge_outs (
+    request_id    TEXT PRIMARY KEY,
+    dest_address  TEXT NOT NULL,
+    amount        TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    miden_tx_id   TEXT,
+    error         TEXT,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
 );
 "#;
 
@@ -624,6 +640,133 @@ async fn list_redemptions_for_user(
     Ok(Json(json!({ "user": user_lower, "redemptions": out })))
 }
 
+// ---------------------------------------------------------------------------
+// Direct canonical Bali outbound (`/v0/bridge-out`)
+//
+// REST half of the BaliWithdrawPanel: the user posts a destAddress +
+// amount, the REST inserts a `pending_bridge_outs` row, and returns a
+// request_id immediately. The worker drains the row, builds + submits
+// the B2AggNote from the relay vault, and writes the Miden tx id back.
+// The frontend polls the GET endpoint for status.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct BridgeOutReq {
+    #[serde(rename = "destAddress")]
+    dest_address: String,
+    amount: String,
+}
+
+async fn create_bridge_out(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<BridgeOutReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // 0x + 40 hex chars, like every other EVM address we accept.
+    let dest = body.dest_address.trim().to_string();
+    let dest_ok = dest.len() == 42
+        && dest.starts_with("0x")
+        && dest[2..].chars().all(|c| c.is_ascii_hexdigit());
+    if !dest_ok {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "destAddress must be a 20-byte hex (0x + 40 chars)" })),
+        ));
+    }
+
+    // Positive integer string, parseable as u128 (we store as text but
+    // the worker re-parses to u64; reject early so a bad payload never
+    // hits the burn path).
+    let amount_str = body.amount.trim().to_string();
+    let amount_ok = !amount_str.is_empty()
+        && amount_str.chars().all(|c| c.is_ascii_digit())
+        && amount_str.parse::<u128>().map(|n| n > 0).unwrap_or(false);
+    if !amount_ok {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "amount must be a positive integer string" })),
+        ));
+    }
+
+    let request_id = format!("bo-{}", Uuid::new_v4());
+    let now = now_unix();
+    {
+        let db = state.db.lock().await;
+        db.execute(
+            r#"INSERT INTO pending_bridge_outs
+                  (request_id, dest_address, amount, status,
+                   miden_tx_id, error, created_at, updated_at)
+                VALUES (?1, ?2, ?3, 'pending', NULL, NULL, ?4, ?4)"#,
+            params![request_id, dest, amount_str, now],
+        )
+        .map_err(internal_err)?;
+    }
+
+    info!(
+        request_id = %request_id,
+        dest = %dest,
+        amount = %amount_str,
+        "bridge-out request enqueued",
+    );
+
+    Ok(Json(json!({
+        "request_id": request_id,
+        "status": "pending",
+    })))
+}
+
+async fn get_bridge_out(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let db = state.db.lock().await;
+    let row = db
+        .query_row(
+            r#"SELECT dest_address, amount, status, miden_tx_id, error,
+                      created_at, updated_at
+                  FROM pending_bridge_outs
+                  WHERE request_id = ?1"#,
+            params![request_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(internal_err)?;
+
+    match row {
+        Some((dest, amount, status, miden_tx, err, created_at, updated_at)) => {
+            // Mirror the txId field name the frontend uses for the
+            // success path so the panel can read `j.txId` directly
+            // without two different shapes.
+            let ok = status == "submitted";
+            Ok(Json(json!({
+                "request_id":   request_id,
+                "dest_address": dest,
+                "amount":       amount,
+                "status":       status,
+                "miden_tx_id":  miden_tx,
+                "txId":         miden_tx,
+                "ok":           ok,
+                "error":        err,
+                "created_at":   created_at,
+                "updated_at":   updated_at,
+            })))
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "bridge-out request not found" })),
+        )),
+    }
+}
+
 async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "service": "darwin-relay-v2" }))
 }
@@ -975,6 +1118,8 @@ async fn main() -> Result<()> {
         .route("/v0/redeem/:redemption_id", get(get_redemption))
         .route("/v0/redemptions/:user_evm_addr", get(list_redemptions_for_user))
         .route("/v0/positions/:user_evm_addr", get(get_positions))
+        .route("/v0/bridge-out", post(create_bridge_out))
+        .route("/v0/bridge-out/:request_id", get(get_bridge_out))
         .layer(cors)
         .with_state(state);
 

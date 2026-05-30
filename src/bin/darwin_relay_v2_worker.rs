@@ -364,6 +364,20 @@ async fn tick(
         }
     }
 
+    // Direct canonical bridge-outs (REST /v0/bridge-out queue). These
+    // are independent of the redemption path — they don't burn a
+    // basket, they just push Bali ETH from the relay vault to a user-
+    // specified Sepolia destination. Same B2AggNote::create primitive
+    // as the redemption outbound, different trigger.
+    process_direct_bridge_outs(
+        client,
+        relay_store_path,
+        relay_wallet,
+        bali_bridge,
+        bali_faucet,
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -1734,6 +1748,256 @@ async fn process_outbound_b2agg(
             "", // no 1Click deposit_address
         )?;
     }
+    Ok(())
+}
+
+/// Drain the `pending_bridge_outs` queue: each row is a user-initiated
+/// canonical Bali outbound from the relay vault (not tied to any
+/// basket position), enqueued by the REST POST /v0/bridge-out handler.
+/// Builds + submits a B2AggNote, writes back the Miden tx id, and
+/// flips the row's status so the GET endpoint reflects the result.
+///
+/// Same B2AggNote::create call shape as `process_outbound_b2agg`; the
+/// difference is the trigger (REST request) and that there's no
+/// basket-burn step or 30 bps redeem-fee.
+async fn process_direct_bridge_outs(
+    client: &mut miden_client::Client<FilesystemKeyStore>,
+    relay_store_path: &str,
+    relay_wallet: AccountId,
+    bali_bridge: AccountId,
+    bali_faucet: AccountId,
+) -> Result<()> {
+    let pending = load_pending_bridge_outs(relay_store_path)?;
+    if pending.is_empty() {
+        info!("no direct bridge-outs pending — idle");
+        return Ok(());
+    }
+    info!(count = pending.len(), "direct bridge-outs to process");
+
+    let relay_acct = client
+        .get_account(relay_wallet)
+        .await?
+        .with_context(|| format!("relay wallet {} not in store", relay_wallet.to_hex()))?;
+    let vault_balance = relay_acct.vault().get_balance(bali_faucet).unwrap_or(0);
+
+    for row in pending {
+        let amount: u64 = match row.amount.parse() {
+            Ok(a) => a,
+            Err(_) => {
+                warn!(
+                    request_id = %row.request_id,
+                    amount = %row.amount,
+                    "amount doesn't fit in u64 — failing the request",
+                );
+                mark_bridge_out_failed(
+                    relay_store_path,
+                    &row.request_id,
+                    &format!("amount {} doesn't fit in u64", row.amount),
+                )?;
+                continue;
+            }
+        };
+
+        if vault_balance < amount {
+            // Same "leave for next tick" semantics as the redemption
+            // path — under-funding is transient (someone may top the
+            // vault up), so we don't mark failed.
+            info!(
+                request_id = %row.request_id,
+                need = amount,
+                have = vault_balance,
+                "relay vault under-funded for direct bridge-out — leaving for next tick",
+            );
+            continue;
+        }
+
+        let l1_dest = match EthAddress::from_hex(&row.dest_address) {
+            Ok(a) => a,
+            Err(e) => {
+                error!(request_id = %row.request_id, error = ?e, "dest_address parse failed");
+                mark_bridge_out_failed(
+                    relay_store_path,
+                    &row.request_id,
+                    &format!("dest_address parse: {e:?}"),
+                )?;
+                continue;
+            }
+        };
+
+        let asset = match FungibleAsset::new(bali_faucet, amount) {
+            Ok(a) => Asset::Fungible(a),
+            Err(e) => {
+                error!(request_id = %row.request_id, error = %e, "fungible asset build failed");
+                mark_bridge_out_failed(
+                    relay_store_path,
+                    &row.request_id,
+                    &format!("fungible asset: {e}"),
+                )?;
+                continue;
+            }
+        };
+        let assets = match NoteAssets::new(vec![asset]) {
+            Ok(a) => a,
+            Err(e) => {
+                error!(request_id = %row.request_id, error = %e, "note assets build failed");
+                mark_bridge_out_failed(
+                    relay_store_path,
+                    &row.request_id,
+                    &format!("note assets: {e}"),
+                )?;
+                continue;
+            }
+        };
+
+        let b2agg = match B2AggNote::create(
+            0, // destination_network = Ethereum L1 (Sepolia)
+            l1_dest,
+            assets,
+            bali_bridge,
+            relay_wallet,
+            client.rng(),
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                error!(request_id = %row.request_id, error = %e, "B2AGG note build failed");
+                mark_bridge_out_failed(
+                    relay_store_path,
+                    &row.request_id,
+                    &format!("B2AGG build: {e}"),
+                )?;
+                continue;
+            }
+        };
+
+        let req = match TransactionRequestBuilder::new()
+            .own_output_notes(vec![b2agg])
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!(request_id = %row.request_id, error = %e, "B2AGG tx-request build failed");
+                mark_bridge_out_failed(
+                    relay_store_path,
+                    &row.request_id,
+                    &format!("B2AGG req: {e}"),
+                )?;
+                continue;
+            }
+        };
+
+        let tx_hex = match client.execute_transaction(relay_wallet, req).await {
+            Ok(result) => {
+                let id = result.executed_transaction().id();
+                let prover = client.prover();
+                let proven = match client.prove_transaction_with(&result, prover).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!(request_id = %row.request_id, error = %e, "B2AGG prove failed");
+                        mark_bridge_out_failed(
+                            relay_store_path,
+                            &row.request_id,
+                            &format!("B2AGG prove: {e}"),
+                        )?;
+                        continue;
+                    }
+                };
+                let height = match client.submit_proven_transaction(proven, &result).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!(request_id = %row.request_id, error = %e, "B2AGG submit failed");
+                        mark_bridge_out_failed(
+                            relay_store_path,
+                            &row.request_id,
+                            &format!("B2AGG submit: {e}"),
+                        )?;
+                        continue;
+                    }
+                };
+                if let Err(e) = client.apply_transaction(&result, height).await {
+                    warn!(request_id = %row.request_id, error = %e, "B2AGG apply_transaction warning");
+                }
+                info!(
+                    request_id = %row.request_id,
+                    miden_tx_id = %id,
+                    height = %height,
+                    "direct bridge-out B2AGG emitted",
+                );
+                format!("{id}")
+            }
+            Err(e) => {
+                error!(request_id = %row.request_id, error = %e, "B2AGG execute failed");
+                mark_bridge_out_failed(
+                    relay_store_path,
+                    &row.request_id,
+                    &format!("B2AGG execute: {e}"),
+                )?;
+                continue;
+            }
+        };
+
+        mark_bridge_out_submitted(relay_store_path, &row.request_id, &tx_hex)?;
+    }
+
+    Ok(())
+}
+
+struct PendingBridgeOut {
+    request_id: String,
+    dest_address: String,
+    amount: String,
+}
+
+fn load_pending_bridge_outs(store_path: &str) -> Result<Vec<PendingBridgeOut>> {
+    let conn = Connection::open(store_path)?;
+    let mut stmt = conn.prepare(
+        r#"SELECT request_id, dest_address, amount
+              FROM pending_bridge_outs
+              WHERE status = 'pending'
+              ORDER BY created_at ASC
+              LIMIT 10"#,
+    )?;
+    let mut rows = stmt.query(params![])?;
+    let mut out = vec![];
+    while let Some(r) = rows.next()? {
+        out.push(PendingBridgeOut {
+            request_id: r.get(0)?,
+            dest_address: r.get(1)?,
+            amount: r.get(2)?,
+        });
+    }
+    Ok(out)
+}
+
+fn mark_bridge_out_submitted(store_path: &str, request_id: &str, miden_tx_id: &str) -> Result<()> {
+    let conn = Connection::open(store_path)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    conn.execute(
+        r#"UPDATE pending_bridge_outs
+              SET status      = 'submitted',
+                  miden_tx_id = ?2,
+                  error       = NULL,
+                  updated_at  = ?3
+              WHERE request_id = ?1"#,
+        params![request_id, miden_tx_id, now],
+    )?;
+    Ok(())
+}
+
+fn mark_bridge_out_failed(store_path: &str, request_id: &str, err: &str) -> Result<()> {
+    let conn = Connection::open(store_path)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    conn.execute(
+        r#"UPDATE pending_bridge_outs
+              SET status     = 'failed',
+                  error      = ?2,
+                  updated_at = ?3
+              WHERE request_id = ?1"#,
+        params![request_id, err, now],
+    )?;
     Ok(())
 }
 
