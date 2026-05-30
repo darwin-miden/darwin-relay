@@ -398,6 +398,8 @@ async fn tick(
                 relay_wallet,
                 bali_bridge,
                 bali_faucet,
+                bali_bridge_service,
+                http,
             )
             .await?;
             process_outbound_status_b2agg(
@@ -428,6 +430,8 @@ async fn tick(
                 relay_wallet,
                 bali_bridge,
                 bali_faucet,
+                bali_bridge_service,
+                http,
             )
             .await?;
             process_outbound_status_b2agg(
@@ -1360,13 +1364,15 @@ async fn process_outbound(
             }
         }
 
-        // 4) Persist.
+        // 4) Persist. Legacy 1Click path doesn't go through the
+        // canonical Bali bridge, so no baseline_cnt is meaningful.
         mark_redemption_outbound(
             relay_store_path,
             &redemption.redemption_id,
             &tx_hex,
             &quote.correlation_id,
             &quote.quote.deposit_address,
+            None,
         )?;
     }
     Ok(())
@@ -1676,12 +1682,42 @@ struct OutboundPending {
 /// user (or anyone) calls `claimAsset` with the merkle proof —
 /// `process_outbound_status_b2agg` watches the bridge service for
 /// that and writes back to sqlite.
+/// Snapshot the bridge service's view of `user_evm_addr` and return
+/// the highest `deposit_cnt` it knows about — or None on network /
+/// decode failure. Used to baseline a b2agg burn before emit: the
+/// post-emit deposit will have a strictly higher cnt, which lets the
+/// claim-watcher disambiguate it from historical same-amount entries.
+async fn fetch_bali_baseline_cnt(
+    http: &reqwest::Client,
+    bridge_service_url: &str,
+    user_evm_addr: &str,
+) -> Option<u32> {
+    let url = format!(
+        "{}/api/bridges/{}",
+        bridge_service_url.trim_end_matches('/'),
+        user_evm_addr.to_lowercase(),
+    );
+    let resp = http.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("deposits")?
+        .as_array()?
+        .iter()
+        .filter_map(|d| d.get("deposit_cnt").and_then(|v| v.as_u64()))
+        .max()
+        .map(|m| m as u32)
+}
+
 async fn process_outbound_b2agg(
     client: &mut miden_client::Client<FilesystemKeyStore>,
     relay_store_path: &str,
     relay_wallet: AccountId,
     bali_bridge: AccountId,
     bali_faucet: AccountId,
+    bridge_service_url: &str,
+    http: &reqwest::Client,
 ) -> Result<()> {
     let pending = load_outbound_pending(relay_store_path)?;
     if pending.is_empty() {
@@ -1765,6 +1801,14 @@ async fn process_outbound_b2agg(
                 continue;
             }
         };
+
+        // Capture the bridge-service baseline BEFORE we emit the burn
+        // — our resulting deposit_cnt is guaranteed to be strictly
+        // greater than every cnt visible at this instant, so the
+        // claim-watcher can later filter out historical same-amount
+        // entries that would otherwise be falsely attributed.
+        let baseline_cnt =
+            fetch_bali_baseline_cnt(http, bridge_service_url, &redemption.user_evm_addr).await;
 
         let b2agg = match B2AggNote::create(
             0, // destination_network = Ethereum L1 (Sepolia)
@@ -1862,6 +1906,7 @@ async fn process_outbound_b2agg(
             &tx_hex,
             "", // no 1Click correlation_id
             "", // no 1Click deposit_address
+            baseline_cnt,
         )?;
     }
     Ok(())
@@ -2144,7 +2189,7 @@ async fn process_outbound_status_b2agg(
         .as_secs() as i64
         - 1500; // 25 minutes
     let mut stmt = conn.prepare(
-        r#"SELECT redemption_id, user_evm_addr, basket_amount
+        r#"SELECT redemption_id, user_evm_addr, basket_amount, bali_baseline_cnt
               FROM redemptions
               WHERE miden_bridge_out_tx IS NOT NULL
                 AND (sepolia_release_tx IS NULL OR sepolia_release_tx = '')
@@ -2159,6 +2204,7 @@ async fn process_outbound_status_b2agg(
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, Option<u32>>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2170,7 +2216,7 @@ async fn process_outbound_status_b2agg(
     }
     info!(count = rows.len(), "polling bali bridge service for L1 claims");
 
-    for (redemption_id, user_evm_addr, basket_amount) in rows {
+    for (redemption_id, user_evm_addr, basket_amount, baseline_cnt) in rows {
         let basket_amount_u64: u64 = match basket_amount.parse() {
             Ok(a) => a,
             Err(_) => continue,
@@ -2211,11 +2257,17 @@ async fn process_outbound_status_b2agg(
         let deposits = body.get("deposits").and_then(|d| d.as_array());
         let Some(deposits) = deposits else { continue };
 
-        // Match by (dest_addr eq user) AND (amount eq expected) AND
-        // (claim_tx_hash present). The bridge service indexes our
-        // outbound burns under the L1 dest_addr; multiple redemptions
-        // from the same user could be in flight, so we additionally
-        // disambiguate by amount.
+        // Match by (deposit_cnt > baseline captured at burn-time) AND
+        // (dest_addr eq user) AND (amount eq expected) AND
+        // (claim_tx_hash present). The cnt > baseline guard prevents
+        // historical claimed burns with the same amount (e.g. an old
+        // 100 DCC redemption months ago) from being falsely attributed
+        // to a new pending redemption that hasn't actually been
+        // claim_tx'd yet. `baseline_cnt = None` means the burn was
+        // emitted by code that pre-dates this disambiguation column —
+        // fall back to the old (buggy) match so legacy rows still
+        // eventually resolve.
+        let cnt_floor = baseline_cnt.unwrap_or(0);
         for dep in deposits {
             let dest_addr = dep
                 .get("dest_addr")
@@ -2232,7 +2284,15 @@ async fn process_outbound_status_b2agg(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             let dest_net = dep.get("dest_net").and_then(|v| v.as_u64()).unwrap_or(99);
+            let dep_cnt = dep
+                .get("deposit_cnt")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(0);
 
+            if dep_cnt <= cnt_floor {
+                continue;
+            }
             if dest_net != 0 {
                 continue;
             }
@@ -2309,6 +2369,7 @@ fn mark_redemption_outbound(
     tx_hex: &str,
     correlation_id: &str,
     deposit_address: &str,
+    bali_baseline_cnt: Option<u32>,
 ) -> Result<()> {
     let conn = Connection::open(store_path)?;
     let now = std::time::SystemTime::now()
@@ -2327,9 +2388,10 @@ fn mark_redemption_outbound(
                   oneclick_correlation       = ?3,
                   oneclick_correlation_id    = ?4,
                   oneclick_deposit_address   = ?5,
-                  updated_at                 = ?6
+                  bali_baseline_cnt          = ?6,
+                  updated_at                 = ?7
               WHERE redemption_id = ?1"#,
-        params![redemption_id, tx_hex, joined, cid, dep, now],
+        params![redemption_id, tx_hex, joined, cid, dep, bali_baseline_cnt, now],
     )?;
     Ok(())
 }

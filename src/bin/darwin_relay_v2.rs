@@ -148,6 +148,12 @@ const MIGRATIONS: &[&str] = &[
     // during the cutover.
     "ALTER TABLE redemptions ADD COLUMN oneclick_correlation_id TEXT",
     "ALTER TABLE redemptions ADD COLUMN oneclick_deposit_address TEXT",
+    // Captures the highest deposit_cnt that exists on the Bali bridge
+    // service for this user AT THE MOMENT we emit the b2agg burn.
+    // The claim-watcher's status poller then only considers entries
+    // with cnt > baseline so historical claimed burns with the same
+    // amount don't get falsely attributed to this redemption.
+    "ALTER TABLE redemptions ADD COLUMN bali_baseline_cnt INTEGER",
     // One-shot backfill of pre-split rows. Idempotent via the
     // `oneclick_correlation_id IS NULL` guard so future startups
     // don't clobber freshly-written values.
