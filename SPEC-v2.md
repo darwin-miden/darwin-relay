@@ -100,7 +100,7 @@ POST `/v0/redeem` with body `{ user_evm_addr, basket_symbol, basket_amount }`:
 7. Return correlationId. The 1Click bridge polls, consumes, releases on
    Sepolia.
 
-For M3 we hard-code the constituent -> wei conversion. M4 reads live
+For M3 we hard-code the constituent -> wei conversion. a future iteration reads live
 Pragma medians for accurate pro-rata.
 
 ### identity mapping (postgres or sqlite)

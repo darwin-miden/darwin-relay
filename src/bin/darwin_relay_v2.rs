@@ -429,7 +429,7 @@ struct AppConfig {
     oneclick_url: String,
     // Tunables — read once at startup from env, default to the values
     // that shipped with M3. Surfacing them here keeps the magic numbers
-    // out of the call sites and makes M4 fee changes a config flip
+    // out of the call sites and makes a future iteration fee changes a config flip
     // instead of a code change.
     wei_per_miden_base: u128,  // EVM 18-dec → Miden 8-dec base unit
     intent_expiry_s: i64,      // /v0/intents expires_at offset
@@ -1132,7 +1132,7 @@ async fn poll_one_intent(state: &Arc<AppState>, mut intent: Intent) -> Result<()
             // same base-unit quantity the on-chain atomic_deposit
             // credits to the controller's slot 10 — otherwise the two
             // portfolio panels diverge by 10 orders of magnitude.
-            // 1:1 USD-equivalent at par for the M3 demo; M4 reads live
+            // 1:1 USD-equivalent at par for the M3 demo; a future iteration reads live
             // Pragma + applies pro-rata across constituents.
             let wei_per_miden_base = state.cfg.wei_per_miden_base;
             let basket_amount = intent

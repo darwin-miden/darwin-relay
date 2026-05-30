@@ -66,7 +66,7 @@ const DEFAULT_RELAY_WALLET_HEX: &str = "0xed3cd5befa3207805f8529207cfc0d";
 
 // Tunables read once from env at first access. Magic numbers that
 // used to be scattered through the call sites (decimal scaling, fee
-// factor, redeem-fee net basis points) live here so M4 fee changes
+// factor, redeem-fee net basis points) live here so a future iteration fee changes
 // or non-1:1 USD pegs are a config flip, not a code change. Defaults
 // match what shipped with M3.
 struct Tunables {
@@ -703,7 +703,7 @@ async fn process_redemptions(
             }
         };
 
-        // The basket-token faucet is symbol-derived in M4; for the M3
+        // The basket-token faucet is symbol-derived in a future iteration; for the M3
         // demo we discover it the same way flow_c_full does — pick a
         // fungible asset from the relay vault with balance >= amount.
         // The atomic redeem note is faucet-agnostic, the controller
@@ -1117,7 +1117,7 @@ async fn process_outbound(
             }
         };
         // 99.7% net of 30 bps redeem fee, matching the on-chain note's
-        // gross_release_factor. M4 routes through Pragma + pro-rata.
+        // gross_release_factor. a future iteration routes through Pragma + pro-rata.
         let underlying = basket_amount.saturating_mul(tunables().redeem_fee_net_bps) / 10_000;
 
         if vault_balance < underlying {
@@ -1573,7 +1573,7 @@ fn mark_redemption_submitted(
     // miden_redeem_tx = the burn-leg tx hash. miden_bridge_out_tx is
     // left null on purpose — it gets set by the outbound 1Click worker
     // once the controller has released underlyings back to the relay
-    // vault and the bridge-out note has been emitted (M4 work).
+    // vault and the bridge-out note has been emitted (a future iteration work).
     let _ = note_hex;
     conn.execute(
         r#"UPDATE redemptions
@@ -1750,7 +1750,7 @@ async fn process_outbound_b2agg(
                 continue;
             }
         };
-        // Same 30 bps redeem-fee net the legacy path applied. M4 will
+        // Same 30 bps redeem-fee net the legacy path applied. a future iteration will
         // route through Pragma + per-constituent pro-rata.
         let underlying = basket_amount.saturating_mul(tunables().redeem_fee_net_bps) / 10_000;
 
