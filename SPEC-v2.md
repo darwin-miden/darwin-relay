@@ -5,7 +5,7 @@ Status: design — not yet built. Supersedes v1 (Sepolia escrow + wDCC ERC20).
 
 ## Why v2 exists
 
-The grant proposal architecture for ETH users (Flow A, second path) reads:
+The architecture for ETH users (Flow A, second path) reads:
 
 > ETH users route through **Near Intent and a relay wallet**, bridging assets
 > to Miden via AggLayer. In both cases, the Transaction Kernel validates
