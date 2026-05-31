@@ -66,7 +66,7 @@ const DEFAULT_RELAY_WALLET_HEX: &str = "0xed3cd5befa3207805f8529207cfc0d";
 
 // Tunables read once from env at first access. Magic numbers that
 // used to be scattered through the call sites (decimal scaling, fee
-// factor, redeem-fee net basis points) live here so a future iteration fee changes
+// factor, redeem-fee net basis points) live here so future fee changes
 // or non-1:1 USD pegs are a config flip, not a code change. Defaults
 // match what shipped with M3.
 struct Tunables {
@@ -1573,7 +1573,7 @@ fn mark_redemption_submitted(
     // miden_redeem_tx = the burn-leg tx hash. miden_bridge_out_tx is
     // left null on purpose — it gets set by the outbound 1Click worker
     // once the controller has released underlyings back to the relay
-    // vault and the bridge-out note has been emitted (a future iteration work).
+    // vault and the bridge-out note has been emitted (future work).
     let _ = note_hex;
     conn.execute(
         r#"UPDATE redemptions

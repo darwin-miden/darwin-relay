@@ -429,7 +429,7 @@ struct AppConfig {
     oneclick_url: String,
     // Tunables — read once at startup from env, default to the values
     // that shipped with M3. Surfacing them here keeps the magic numbers
-    // out of the call sites and makes a future iteration fee changes a config flip
+    // out of the call sites and makes future fee changes a config flip
     // instead of a code change.
     wei_per_miden_base: u128,  // EVM 18-dec → Miden 8-dec base unit
     intent_expiry_s: i64,      // /v0/intents expires_at offset

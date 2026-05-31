@@ -137,7 +137,7 @@ proc write_user_position
     push.103 mem_load                  # user_id_suffix
     push.104 mem_load                  # user_id_prefix
     # basket_id = (0, 0); discriminator is implicit in the targeted
-    # controller. M4 adds a second basket field for multi-basket.
+    # controller. a future iteration adds a second basket field for multi-basket.
     push.0 push.0
     # Stack: [0, 0, user_id_prefix, user_id_suffix, total, ...]
     # set_map_item expects the KEY word in stack-bottom order:
