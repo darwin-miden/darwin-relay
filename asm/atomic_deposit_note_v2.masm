@@ -1,6 +1,6 @@
 # Atomic DepositNote v2 — atomic_deposit_note + per-user storage write.
 #
-# Adds the M1.4b leg: after the asset lands in the v5 controller's
+# Adds the second-phase leg: after the asset lands in the v5 controller's
 # vault, the note credits the user's slot-10 StorageMap position.
 # The position ACCUMULATES across deposits: the note first reads the
 # current slot-10 amount via `get_user_position`, adds the freshly

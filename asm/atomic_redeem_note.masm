@@ -15,7 +15,7 @@
 #      hand them over to the controller via `call.receive_asset` — the
 #      assets land in the controller's vault, which is the on-chain
 #      effect of "burning" the user's basket tokens (they leave
-#      circulation; M2 chains in a basket-faucet `burn` call to
+#      circulation; a later version chains in a basket-faucet `burn` call to
 #      reduce supply explicitly).
 #
 #   3. Return at stack depth 16 (kernel requirement).
