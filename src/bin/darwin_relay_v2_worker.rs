@@ -111,6 +111,21 @@ fn tunables() -> &'static Tunables {
 // are byte-identical to v5; only the get_* read procs differ. Older
 // deploys can still be targeted via the CLI override.
 const DEFAULT_CONTROLLER_HEX: &str = "0x2a3ea0a268d97b80497d6a966e3141";
+
+// "Native" controller — the controller the frontend targets when a
+// user emits a deposit note directly from their Miden wallet (no
+// relay hop, no 1Click). Same controller as the relay-driven path
+// (v6 fee-routing) because the bare v2 "real-bodies" controller
+// lacks slot-10 (per-user position map) and slot-11 (fee recipient),
+// so notes hitting it would leave assets in the aggregate vault but
+// never credit a user position. By targeting v6, user-emitted notes
+// accumulate into the same on-chain ledger as relay-emitted ones and
+// the portfolio UI reads a single source of truth. This worker
+// watches v6 for inbound user-emitted notes and runs the consume tx
+// that credits the user's slot — independently of `process_deposits`
+// which only handles relay-tracked intents. Set the env var to the
+// empty string to disable native-side polling.
+const DEFAULT_NATIVE_CONTROLLER_HEX: &str = "0x2a3ea0a268d97b80497d6a966e3141";
 // Miden testnet dETH faucet (the M1 deth-equivalent fungible faucet
 // the basket controllers know about). The 1Click bridge mints
 // `miden-testnet:eth` from a single faucet at runtime — the relay
@@ -175,6 +190,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| DEFAULT_RELAY_WALLET_HEX.to_string());
     let controller_hex = std::env::var("DARWIN_RELAY_V2_CONTROLLER_HEX")
         .unwrap_or_else(|_| DEFAULT_CONTROLLER_HEX.to_string());
+    // Empty string = disable native-side polling (rollback knob).
+    let native_controller_hex = std::env::var("DARWIN_RELAY_V2_NATIVE_CONTROLLER_HEX")
+        .unwrap_or_else(|_| DEFAULT_NATIVE_CONTROLLER_HEX.to_string());
     let faucet_hex = std::env::var("DARWIN_RELAY_V2_FAUCET_HEX")
         .unwrap_or_else(|_| DEFAULT_DETH_FAUCET_HEX.to_string());
     let oneclick_faucet_hex = std::env::var("DARWIN_RELAY_V2_OUTBOUND_FAUCET_HEX")
@@ -196,6 +214,25 @@ async fn main() -> Result<()> {
 
     let relay_wallet = AccountId::from_hex(&relay_wallet_hex)?;
     let controller = AccountId::from_hex(&controller_hex)?;
+    let native_controller = if native_controller_hex.trim().is_empty() {
+        None
+    } else {
+        Some(AccountId::from_hex(&native_controller_hex)?)
+    };
+    // NoteTag::with_account_target on the native controller — used as
+    // a filter signal in both directions:
+    //   1. drain_native_controller scans consumable notes (any account)
+    //      and keeps only those whose metadata tag == native_tag, since
+    //      miden-client's get_consumable_notes(controller) doesn't
+    //      reliably surface user-emitted custom-script notes for the
+    //      controller alone.
+    //   2. drain_inbound_notes (relay wallet) skips notes carrying
+    //      native_tag so the relay doesn't race the controller and
+    //      win — that would land the asset in the relay vault instead
+    //      of the controller vault.
+    // None when native polling is disabled.
+    let native_tag: Option<u32> =
+        native_controller.map(|id| NoteTag::with_account_target(id).as_u32());
     let deth_faucet = AccountId::from_hex(&faucet_hex)?;
     let oneclick_faucet = AccountId::from_hex(&oneclick_faucet_hex)?;
     let bali_bridge = AccountId::from_hex(&bali_bridge_hex)?;
@@ -206,6 +243,8 @@ async fn main() -> Result<()> {
         %miden_store,
         %relay_wallet_hex,
         %controller_hex,
+        native_controller = %native_controller_hex,
+        native_tag = ?native_tag,
         %faucet_hex,
         %oneclick_faucet_hex,
         %oneclick_url,
@@ -294,6 +333,8 @@ async fn main() -> Result<()> {
             &store_path,
             relay_wallet,
             controller,
+            native_controller,
+            native_tag,
             deth_faucet,
             oneclick_faucet,
             &oneclick_url,
@@ -348,6 +389,8 @@ async fn tick(
     relay_store_path: &str,
     relay_wallet: AccountId,
     controller: AccountId,
+    native_controller: Option<AccountId>,
+    native_tag: Option<u32>,
     deth_faucet: AccountId,
     oneclick_faucet: AccountId,
     oneclick_url: &str,
@@ -363,11 +406,26 @@ async fn tick(
     info!("syncing miden-client state…");
     client.sync_state().await.context("sync_state")?;
 
+    // Native-controller drain runs FIRST so that user-emitted Darwin
+    // notes (Miden-native deposits) land in the controller vault
+    // before the relay drain has a chance to claim them and route
+    // the asset into the wrong vault. The relay drain below also
+    // filters native_tag out as a belt-and-suspenders measure, but
+    // ordering is the primary defence.
+    if let Some(nc) = native_controller {
+        if let Err(e) = drain_native_controller(client, nc, native_tag).await {
+            warn!(error = %e, "drain_native_controller failed (continuing)");
+        }
+    }
+
     // Inbound notes (1Click deliveries) sit in COMMITTED state until
-    // someone runs a consume tx against them. Drain them first so the
+    // someone runs a consume tx against them. Drain them so the
     // relay vault reflects the latest inflows before the other passes
-    // snapshot it.
-    if let Err(e) = drain_inbound_notes(client, relay_wallet).await {
+    // snapshot it. Skip anything carrying native_tag — those are
+    // user-emitted notes destined for the native controller, not the
+    // relay; consuming them here would deposit the asset in the
+    // relay vault instead of the controller's.
+    if let Err(e) = drain_inbound_notes(client, relay_wallet, native_tag).await {
         warn!(error = %e, "drain_inbound_notes failed (continuing)");
     }
 
@@ -463,6 +521,7 @@ async fn tick(
 async fn drain_inbound_notes(
     client: &mut miden_client::Client<FilesystemKeyStore>,
     relay_wallet: AccountId,
+    native_tag: Option<u32>,
 ) -> Result<()> {
     // Notes that have been failing to execute against the relay
     // wallet repeatedly — usually because their script targets a
@@ -514,6 +573,18 @@ async fn drain_inbound_notes(
             // already triaged; logging on every tick is just noise.
             continue;
         }
+        // Defer notes tagged for the native controller. miden-client
+        // lists them as relay-consumable too (custom-script notes
+        // surface to every tracked account), but consuming them here
+        // would execute the deposit script in the relay's context and
+        // park the asset in the relay vault. Leave them for the
+        // native drain pass, which executes in the controller's
+        // context and lands the asset in the controller vault.
+        if let Some(nt) = native_tag {
+            if note.metadata().tag().as_u32() == nt {
+                continue;
+            }
+        }
         let req = match TransactionRequestBuilder::new().build_consume_notes(vec![note]) {
             Ok(r) => r,
             Err(e) => {
@@ -551,6 +622,115 @@ async fn drain_inbound_notes(
         consumed += 1;
     }
     info!(consumed, "drain pass complete");
+    Ok(())
+}
+
+// Drain notes targeting the Miden-native real-bodies controller. The
+// frontend's MidenDepositPanel emits notes here directly (sender = the
+// user's Miden wallet, recipient tag = native controller). With
+// NoteType::Public those notes are discoverable by anyone syncing the
+// chain; the controller still needs a tx to actually consume each
+// one. That's what this pass does.
+//
+// Mirrors `drain_inbound_notes` but acts on the controller account
+// instead of the relay wallet, and reuses the same deny-list env var
+// to silence known-stuck ghosts regardless of which account they
+// happen to look consumable for.
+async fn drain_native_controller(
+    client: &mut miden_client::Client<FilesystemKeyStore>,
+    native_controller: AccountId,
+    native_tag: Option<u32>,
+) -> Result<()> {
+    let deny_list: std::collections::HashSet<String> = std::env::var("DARWIN_RELAY_V2_INBOUND_DENY")
+        .unwrap_or_else(|_| {
+            "0xd7d0c957bec74431a20eeea34cc5f64a6bb9f2683d966bceece3ef3cc7d765bb".to_string()
+        })
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Query the union of "consumable for the controller" + "consumable
+    // for anyone" because miden-client's get_consumable_notes filter
+    // is best-effort: custom-script user notes only show up in the
+    // any-account list, never under the specific controller, even
+    // though the controller is the only account that can correctly
+    // execute them. native_tag is the discriminator we use to
+    // recognise them in that broader list.
+    let mut by_id: std::collections::HashMap<miden_client::note::NoteId, miden_client::note::Note> =
+        std::collections::HashMap::new();
+    let primary = client.get_consumable_notes(Some(native_controller)).await?;
+    for (rec, _rel) in primary {
+        if let Ok(n) = TryInto::<Note>::try_into(rec) {
+            by_id.insert(n.id(), n);
+        }
+    }
+    if let Some(nt) = native_tag {
+        let anyone = client.get_consumable_notes(None).await?;
+        for (rec, _rel) in anyone {
+            if let Ok(n) = TryInto::<Note>::try_into(rec) {
+                if n.metadata().tag().as_u32() == nt {
+                    by_id.entry(n.id()).or_insert(n);
+                }
+            }
+        }
+    }
+    if by_id.is_empty() {
+        return Ok(());
+    }
+    info!(
+        count = by_id.len(),
+        native_controller = %native_controller.to_hex(),
+        "candidate notes targeting native controller",
+    );
+
+    let mut consumed = 0usize;
+    for note in by_id.into_values() {
+        let note_id = note.id();
+        let note_id_str = format!("{note_id}").to_lowercase();
+        if deny_list.contains(&note_id_str) {
+            continue;
+        }
+        let req = match TransactionRequestBuilder::new().build_consume_notes(vec![note]) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(%note_id, error = %e, "skip: build_consume_notes failed (native)");
+                continue;
+            }
+        };
+        let result = match client.execute_transaction(native_controller, req).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(%note_id, error = %e, "skip: execute failed (native controller)");
+                continue;
+            }
+        };
+        let tx_id = result.executed_transaction().id();
+        let prover = client.prover();
+        let proven = match client.prove_transaction_with(&result, prover).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(%note_id, error = %e, "skip: prove failed (native)");
+                continue;
+            }
+        };
+        let height = match client.submit_proven_transaction(proven, &result).await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(%note_id, error = %e, "skip: submit failed (native)");
+                continue;
+            }
+        };
+        if let Err(e) = client.apply_transaction(&result, height).await {
+            warn!(%note_id, error = %e, "apply warning (native)");
+        }
+        info!(
+            %note_id, %tx_id, %height,
+            "native deposit note consumed by controller (slot credited)",
+        );
+        consumed += 1;
+    }
+    info!(consumed, "native controller drain pass complete");
     Ok(())
 }
 
