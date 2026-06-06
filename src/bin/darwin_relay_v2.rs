@@ -1071,6 +1071,81 @@ async fn oneclick_status(base: &str, deposit_address: &str) -> Result<OneClickSt
     Ok(json)
 }
 
+// Mirrors the frontend's PricesResponse + the worker's same struct in
+// darwin_relay_v2_worker.rs. The HTTP server needs its own copy so the
+// optimistic basket_amount_minted written on 1Click=SUCCESS uses the
+// same NAV-aware formula the worker applies on submit — otherwise the
+// frontend's 'Position credited' chip locks in a wrong number (it
+// stops re-polling once it sees POSITION_CREDITED).
+#[derive(serde::Deserialize, Debug, Clone)]
+struct PricesResponse {
+    eth: f64,
+    wbtc: f64,
+    usdt: f64,
+    dai: f64,
+}
+
+async fn fetch_prices() -> Result<PricesResponse> {
+    let url = std::env::var("DARWIN_RELAY_V2_PRICES_URL")
+        .unwrap_or_else(|_| "https://darwin.market/api/prices".to_string());
+    let resp = reqwest::get(&url)
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .with_context(|| format!("GET {url} non-2xx"))?;
+    let body: PricesResponse = resp
+        .json()
+        .await
+        .with_context(|| format!("decode {url} as PricesResponse"))?;
+    Ok(body)
+}
+
+// Same weights as darwin-frontend/src/lib/baskets.ts and the worker's
+// basket_nav_usd. All three must stay in sync — when a new basket lands
+// it must be added in all of them.
+fn basket_nav_usd(symbol: &str, p: &PricesResponse) -> Option<f64> {
+    match symbol {
+        "DCC" => Some(0.40 * p.wbtc + 0.40 * p.eth + 0.20 * p.usdt),
+        "DAG" => Some(0.50 * p.wbtc + 0.50 * p.eth),
+        "DCO" => Some(0.10 * p.wbtc + 0.10 * p.eth + 0.40 * p.usdt + 0.40 * p.dai),
+        _ => None,
+    }
+}
+
+// Mint computation matching the worker's submit_atomic_deposit and the
+// frontend's computeStorageFelts. For the 1Click rail dETH (8-dec) is
+// the only inbound asset today and every basket token is 8-dec, so
+// nav_scale simplifies to `nav * 10000` (basket_dec - asset_dec = 0).
+// When other assets bridge in, surface their decimals on the intent so
+// the formula can re-introduce the `/ 10^(basket_dec - asset_dec)` term.
+const ASSET_DECIMALS_DETH: i32 = 8;
+const BASKET_TOKEN_DECIMALS: i32 = 8;
+fn compute_expected_mint(
+    amount_basket_base: u64,
+    asset_price_usd: f64,
+    basket_nav_usd: f64,
+) -> u64 {
+    let fee_factor: u64 = 9_970;
+    let asset_price_round = asset_price_usd.round().max(1.0) as u64;
+    let deposit_value: u64 = amount_basket_base
+        .saturating_mul(asset_price_round)
+        .max(1);
+    let nav_flat: u64 = basket_nav_usd.round().max(1.0) as u64;
+    let basket_minus_asset_dec: i32 = BASKET_TOKEN_DECIMALS - ASSET_DECIMALS_DETH;
+    let mut nav_scale: u64 = nav_flat.saturating_mul(10_000);
+    if basket_minus_asset_dec > 0 {
+        let div = 10u64.pow(basket_minus_asset_dec as u32);
+        nav_scale = (nav_scale / div).max(1);
+    } else if basket_minus_asset_dec < 0 {
+        let mul = 10u64.pow((-basket_minus_asset_dec) as u32);
+        nav_scale = nav_scale.saturating_mul(mul);
+    }
+    ((deposit_value as u128)
+        .saturating_mul(fee_factor as u128)
+        / (nav_scale.max(1) as u128))
+        .min(u64::MAX as u128) as u64
+}
+
 // ---------------------------------------------------------------------------
 // Background poller — marches intent stages
 // ---------------------------------------------------------------------------
@@ -1124,22 +1199,56 @@ async fn poll_one_intent(state: &Arc<AppState>, mut intent: Intent) -> Result<()
             // Stage transition recorded here; the submit hook
             // observer can drive the rest.
             intent.stage = "POSITION_CREDITED".to_string();
-            // The frontend sends amount_in_wei in EVM 18-decimal wei.
-            // The Miden side (dETH faucet, controller slot-10 credit)
-            // operates in the 8-decimal convention, so the worker
-            // scales the on-chain deposit by ÷10^10. Mirror that here
-            // so the off-chain ledger (RelayPositionsPanel) shows the
-            // same base-unit quantity the on-chain atomic_deposit
-            // credits to the controller's slot 10 — otherwise the two
-            // portfolio panels diverge by 10 orders of magnitude.
-            // 1:1 USD-equivalent at par for the M3 demo; a future iteration reads live
-            // Pragma + applies pro-rata across constituents.
+            // Compute the SAME mint number the worker will land on
+            // slot-10 (deposit_value * fee_factor / nav_scale, with
+            // deposit_value = amount_basket_base * asset_price and
+            // nav_scale = nav * 10000 for 8-dec assets). The frontend's
+            // 'Position credited' chip reads this column once and stops
+            // re-polling, so if we wrote the stale (wei / 10^10) here
+            // the UI would lock in 0.00001 DCC for every 0.00001 ETH
+            // deposit regardless of the basket NAV — visually 16-160×
+            // over-stating the credit. The worker still overwrites this
+            // value when it submits (mark_intent_submitted), so even if
+            // prices were stale here the on-chain ledger stays correct.
             let wei_per_miden_base = state.cfg.wei_per_miden_base;
-            let basket_amount = intent
+            let amount_basket_base: u64 = intent
                 .amount_in_wei
                 .parse::<u128>()
-                .map(|wei| (wei / wei_per_miden_base).max(1).to_string())
-                .unwrap_or_else(|_| intent.amount_in_wei.clone());
+                .map(|wei| ((wei / wei_per_miden_base).max(1)) as u64)
+                .unwrap_or(0);
+            let basket_amount: String = match fetch_prices().await {
+                Ok(prices) => match basket_nav_usd(&intent.basket_symbol, &prices) {
+                    Some(nav) if nav > 0.0 => {
+                        let mint =
+                            compute_expected_mint(amount_basket_base, prices.eth, nav);
+                        info!(
+                            correlation_id = %intent.correlation_id,
+                            amount_basket_base,
+                            asset_price_usd = prices.eth,
+                            basket_nav_usd = nav,
+                            expected_mint = mint,
+                            "optimistic mint (matches worker formula)",
+                        );
+                        mint.max(1).to_string()
+                    }
+                    _ => {
+                        warn!(
+                            basket = %intent.basket_symbol,
+                            "no NAV for basket — falling back to pre-NAV estimate; \
+                             worker writeback will correct on submit",
+                        );
+                        amount_basket_base.max(1).to_string()
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        error = format!("{e:#}"),
+                        "prices fetch failed in credit branch — \
+                         using pre-NAV estimate; worker writeback corrects later",
+                    );
+                    amount_basket_base.max(1).to_string()
+                }
+            };
             intent.basket_amount_minted = Some(basket_amount.clone());
             let db = state.db.lock().await;
             credit_position(
