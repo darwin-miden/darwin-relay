@@ -1203,8 +1203,17 @@ async fn submit_atomic_deposit(
         })?;
         let basket_account = AccountId::from_hex(basket_hex)
             .with_context(|| format!("basket_faucet_hex for {} is not parseable", intent.basket_symbol))?;
-        storage_felts.push(basket_account.suffix());
-        storage_felts.push(basket_account.prefix().as_felt());
+        let basket_suffix_felt = basket_account.suffix();
+        let basket_prefix_felt = basket_account.prefix().as_felt();
+        info!(
+            correlation_id = %intent.correlation_id,
+            basket_symbol = %intent.basket_symbol,
+            basket_suffix = format!("{basket_suffix_felt}"),
+            basket_prefix = format!("{basket_prefix_felt}"),
+            "atomic_deposit basket key felts",
+        );
+        storage_felts.push(basket_suffix_felt);
+        storage_felts.push(basket_prefix_felt);
     }
     let recipient = NoteRecipient::new(
         serial_num,
