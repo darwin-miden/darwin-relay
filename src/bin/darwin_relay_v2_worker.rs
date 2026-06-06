@@ -924,11 +924,12 @@ async fn process_deposits(
         )
         .await
         {
-            Ok((tx_hex, note_hex)) => {
+            Ok((tx_hex, note_hex, minted_basket_base)) => {
                 info!(
                     correlation_id = %intent.correlation_id,
                     atomic_deposit_tx = %tx_hex,
                     note_id = %note_hex,
+                    minted_basket_base,
                     "atomic_deposit_note submitted",
                 );
                 mark_intent_submitted(
@@ -936,6 +937,7 @@ async fn process_deposits(
                     &intent.correlation_id,
                     &tx_hex,
                     &note_hex,
+                    minted_basket_base,
                 )?;
                 vault_balance -= amount;
             }
@@ -1081,7 +1083,7 @@ async fn submit_atomic_deposit(
     basket_nav_usd: f64,
     note_script: &NoteScript,
     intent: &PendingIntent,
-) -> Result<(String, String)> {
+) -> Result<(String, String, u64)> {
     let assets = NoteAssets::new(vec![Asset::Fungible(FungibleAsset::new(
         deth_faucet,
         amount,
@@ -1141,6 +1143,14 @@ async fn submit_atomic_deposit(
         let mul = 10u64.pow((-basket_minus_asset_dec) as u32);
         nav_scale = nav_scale.saturating_mul(mul);
     }
+    // Mint the controller will land in slot-10. Same formula the MASM
+    // runs (deposit_value * fee_factor / nav_scale) — the worker
+    // returns it so mark_intent_submitted can overwrite the HTTP
+    // server's optimistic placeholder with the authoritative number.
+    let expected_mint: u64 = ((deposit_value as u128)
+        .saturating_mul(fee_factor as u128)
+        / (nav_scale.max(1) as u128))
+        .min(u64::MAX as u128) as u64;
     info!(
         correlation_id = %intent.correlation_id,
         amount,
@@ -1149,7 +1159,7 @@ async fn submit_atomic_deposit(
         deposit_value,
         fee_factor,
         nav_scale,
-        expected_mint = deposit_value as u128 * fee_factor as u128 / nav_scale.max(1) as u128,
+        expected_mint,
         "atomic_deposit nav math",
     );
     let mut storage_felts = vec![
@@ -1256,7 +1266,7 @@ async fn submit_atomic_deposit(
         "controller consumed atomic_deposit note (slot-10 credited)",
     );
 
-    Ok((format!("{tx_id}"), format!("{note_id}")))
+    Ok((format!("{tx_id}"), format!("{note_id}"), expected_mint))
 }
 
 async fn submit_atomic_redeem(
@@ -1847,18 +1857,33 @@ fn mark_intent_submitted(
     correlation_id: &str,
     tx_hex: &str,
     note_hex: &str,
+    minted_basket_base: u64,
 ) -> Result<()> {
     let conn = Connection::open(store_path)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
+    // Overwrite the optimistic basket_amount_minted the HTTP server
+    // wrote on 1Click=SUCCESS (it estimated amount_in_wei ÷ 10^10,
+    // which conflates asset base units with basket base units — the
+    // same NAV-collapse bug we fixed in submit_atomic_deposit). The
+    // worker's number is authoritative because it matches what the
+    // controller's slot-10 actually credited (deposit_value *
+    // fee_factor / nav_scale).
     conn.execute(
         r#"UPDATE intents
-              SET atomic_deposit_tx = ?2,
-                  miden_consume_tx  = ?3,
-                  updated_at        = ?4
+              SET atomic_deposit_tx    = ?2,
+                  miden_consume_tx     = ?3,
+                  basket_amount_minted = ?4,
+                  updated_at           = ?5
               WHERE correlation_id = ?1"#,
-        params![correlation_id, tx_hex, note_hex, now],
+        params![
+            correlation_id,
+            tx_hex,
+            note_hex,
+            minted_basket_base.to_string(),
+            now,
+        ],
     )?;
     Ok(())
 }
