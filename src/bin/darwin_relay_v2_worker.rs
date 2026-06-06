@@ -352,7 +352,7 @@ async fn main() -> Result<()> {
         let status = match &tick_result {
             Ok(()) => "ok".to_string(),
             Err(e) => {
-                error!(error = %e, "tick failed");
+                error!(error = format!("{e:#}"), "tick failed");
                 // First 200 chars of the error so /v0/worker-health can
                 // surface it without a log scrape.
                 let s = format!("{e:?}");
@@ -360,7 +360,7 @@ async fn main() -> Result<()> {
             }
         };
         if let Err(e) = write_heartbeat(&store_path, "main", &status) {
-            warn!(error = %e, "heartbeat write failed");
+            warn!(error = format!("{e:#}"), "heartbeat write failed");
         }
 
         tokio::time::sleep(Duration::from_secs(poll_interval_s)).await;
@@ -414,7 +414,7 @@ async fn tick(
     // ordering is the primary defence.
     if let Some(nc) = native_controller {
         if let Err(e) = drain_native_controller(client, nc, native_tag).await {
-            warn!(error = %e, "drain_native_controller failed (continuing)");
+            warn!(error = format!("{e:#}"), "drain_native_controller failed (continuing)");
         }
     }
 
@@ -426,7 +426,7 @@ async fn tick(
     // relay; consuming them here would deposit the asset in the
     // relay vault instead of the controller's.
     if let Err(e) = drain_inbound_notes(client, relay_wallet, native_tag).await {
-        warn!(error = %e, "drain_inbound_notes failed (continuing)");
+        warn!(error = format!("{e:#}"), "drain_inbound_notes failed (continuing)");
     }
 
     process_deposits(
@@ -562,7 +562,7 @@ async fn drain_inbound_notes(
         let note: Note = match TryInto::<Note>::try_into(rec) {
             Ok(n) => n,
             Err(e) => {
-                warn!(error = %e, "skip: not a consumable Note");
+                warn!(error = format!("{e:#}"), "skip: not a consumable Note");
                 continue;
             }
         };
@@ -588,14 +588,14 @@ async fn drain_inbound_notes(
         let req = match TransactionRequestBuilder::new().build_consume_notes(vec![note]) {
             Ok(r) => r,
             Err(e) => {
-                warn!(%note_id, error = %e, "skip: build_consume_notes failed");
+                warn!(%note_id, error = format!("{e:#}"), "skip: build_consume_notes failed");
                 continue;
             }
         };
         let result = match client.execute_transaction(relay_wallet, req).await {
             Ok(r) => r,
             Err(e) => {
-                warn!(%note_id, error = %e, "skip: execute failed");
+                warn!(%note_id, error = format!("{e:#}"), "skip: execute failed");
                 continue;
             }
         };
@@ -604,19 +604,19 @@ async fn drain_inbound_notes(
         let proven = match client.prove_transaction_with(&result, prover).await {
             Ok(p) => p,
             Err(e) => {
-                warn!(%note_id, error = %e, "skip: prove failed");
+                warn!(%note_id, error = format!("{e:#}"), "skip: prove failed");
                 continue;
             }
         };
         let height = match client.submit_proven_transaction(proven, &result).await {
             Ok(h) => h,
             Err(e) => {
-                warn!(%note_id, error = %e, "skip: submit failed");
+                warn!(%note_id, error = format!("{e:#}"), "skip: submit failed");
                 continue;
             }
         };
         if let Err(e) = client.apply_transaction(&result, height).await {
-            warn!(%note_id, error = %e, "apply warning");
+            warn!(%note_id, error = format!("{e:#}"), "apply warning");
         }
         info!(%note_id, %tx_id, %height, "inbound note consumed");
         consumed += 1;
@@ -694,14 +694,14 @@ async fn drain_native_controller(
         let req = match TransactionRequestBuilder::new().build_consume_notes(vec![note]) {
             Ok(r) => r,
             Err(e) => {
-                warn!(%note_id, error = %e, "skip: build_consume_notes failed (native)");
+                warn!(%note_id, error = format!("{e:#}"), "skip: build_consume_notes failed (native)");
                 continue;
             }
         };
         let result = match client.execute_transaction(native_controller, req).await {
             Ok(r) => r,
             Err(e) => {
-                warn!(%note_id, error = %e, "skip: execute failed (native controller)");
+                warn!(%note_id, error = format!("{e:#}"), "skip: execute failed (native controller)");
                 continue;
             }
         };
@@ -710,19 +710,19 @@ async fn drain_native_controller(
         let proven = match client.prove_transaction_with(&result, prover).await {
             Ok(p) => p,
             Err(e) => {
-                warn!(%note_id, error = %e, "skip: prove failed (native)");
+                warn!(%note_id, error = format!("{e:#}"), "skip: prove failed (native)");
                 continue;
             }
         };
         let height = match client.submit_proven_transaction(proven, &result).await {
             Ok(h) => h,
             Err(e) => {
-                warn!(%note_id, error = %e, "skip: submit failed (native)");
+                warn!(%note_id, error = format!("{e:#}"), "skip: submit failed (native)");
                 continue;
             }
         };
         if let Err(e) = client.apply_transaction(&result, height).await {
-            warn!(%note_id, error = %e, "apply warning (native)");
+            warn!(%note_id, error = format!("{e:#}"), "apply warning (native)");
         }
         info!(
             %note_id, %tx_id, %height,
@@ -832,7 +832,7 @@ async fn process_deposits(
             Err(e) => {
                 error!(
                     correlation_id = %intent.correlation_id,
-                    error = %e,
+                    error = format!("{e:#}"),
                     "atomic_deposit submission failed",
                 );
                 mark_intent_error(
@@ -928,7 +928,7 @@ async fn process_redemptions(
             Err(e) => {
                 error!(
                     redemption_id = %redemption.redemption_id,
-                    error = %e,
+                    error = format!("{e:#}"),
                     "atomic_redeem submission failed",
                 );
                 mark_redemption_error(
@@ -1330,7 +1330,7 @@ async fn process_outbound(
         let resp = match http.post(&url).json(&quote_req).send().await {
             Ok(r) => r,
             Err(e) => {
-                error!(redemption_id = %redemption.redemption_id, error = %e, "1Click quote http failed");
+                error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "1Click quote http failed");
                 mark_redemption_error(
                     relay_store_path,
                     &redemption.redemption_id,
@@ -1353,7 +1353,7 @@ async fn process_outbound(
         let quote: OneClickQuoteResp = match resp.json().await {
             Ok(q) => q,
             Err(e) => {
-                error!(redemption_id = %redemption.redemption_id, error = %e, "1Click quote decode failed");
+                error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "1Click quote decode failed");
                 mark_redemption_error(
                     relay_store_path,
                     &redemption.redemption_id,
@@ -1382,7 +1382,7 @@ async fn process_outbound(
         let memo: BridgeOutMemo = match serde_json::from_str(memo_str) {
             Ok(m) => m,
             Err(e) => {
-                error!(redemption_id = %redemption.redemption_id, error = %e, "depositMemo decode failed");
+                error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "depositMemo decode failed");
                 mark_redemption_error(
                     relay_store_path,
                     &redemption.redemption_id,
@@ -1412,7 +1412,7 @@ async fn process_outbound(
         {
             Ok(v) => v,
             Err(e) => {
-                error!(redemption_id = %redemption.redemption_id, error = %e, "storage_items parse failed");
+                error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "storage_items parse failed");
                 mark_redemption_error(
                     relay_store_path,
                     &redemption.redemption_id,
@@ -1462,7 +1462,7 @@ async fn process_outbound(
         {
             Ok(r) => r,
             Err(e) => {
-                error!(redemption_id = %redemption.redemption_id, error = %e, "bridge-out build failed");
+                error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "bridge-out build failed");
                 mark_redemption_error(
                     relay_store_path,
                     &redemption.redemption_id,
@@ -1478,7 +1478,7 @@ async fn process_outbound(
                 let proven = match client.prove_transaction_with(&result, prover).await {
                     Ok(p) => p,
                     Err(e) => {
-                        error!(redemption_id = %redemption.redemption_id, error = %e, "outbound prove failed");
+                        error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "outbound prove failed");
                         mark_redemption_error(
                             relay_store_path,
                             &redemption.redemption_id,
@@ -1490,7 +1490,7 @@ async fn process_outbound(
                 let height = match client.submit_proven_transaction(proven, &result).await {
                     Ok(h) => h,
                     Err(e) => {
-                        error!(redemption_id = %redemption.redemption_id, error = %e, "outbound submit failed");
+                        error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "outbound submit failed");
                         mark_redemption_error(
                             relay_store_path,
                             &redemption.redemption_id,
@@ -1500,7 +1500,7 @@ async fn process_outbound(
                     }
                 };
                 if let Err(e) = client.apply_transaction(&result, height).await {
-                    warn!(redemption_id = %redemption.redemption_id, error = %e, "apply_transaction warning");
+                    warn!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "apply_transaction warning");
                 }
                 info!(
                     redemption_id = %redemption.redemption_id,
@@ -1511,7 +1511,7 @@ async fn process_outbound(
                 format!("{id}")
             }
             Err(e) => {
-                error!(redemption_id = %redemption.redemption_id, error = %e, "outbound execute failed");
+                error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "outbound execute failed");
                 mark_redemption_error(
                     relay_store_path,
                     &redemption.redemption_id,
@@ -1540,7 +1540,7 @@ async fn process_outbound(
                 );
             }
             Err(e) => {
-                warn!(redemption_id = %redemption.redemption_id, error = %e, "1Click deposit/submit http failed (continuing)");
+                warn!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "1Click deposit/submit http failed (continuing)");
             }
         }
 
@@ -1579,7 +1579,7 @@ async fn process_outbound_status(
         let resp = match http.get(&url).send().await {
             Ok(r) => r,
             Err(e) => {
-                warn!(rid = %rid, error = %e, "1Click status http failed (continuing)");
+                warn!(rid = %rid, error = format!("{e:#}"), "1Click status http failed (continuing)");
                 continue;
             }
         };
@@ -1590,7 +1590,7 @@ async fn process_outbound_status(
         let status: OneClickStatusResp = match resp.json().await {
             Ok(s) => s,
             Err(e) => {
-                warn!(rid = %rid, error = %e, "1Click status decode failed");
+                warn!(rid = %rid, error = format!("{e:#}"), "1Click status decode failed");
                 continue;
             }
         };
@@ -1960,7 +1960,7 @@ async fn process_outbound_b2agg(
         let asset = match FungibleAsset::new(bali_faucet, underlying) {
             Ok(a) => Asset::Fungible(a),
             Err(e) => {
-                error!(redemption_id = %redemption.redemption_id, error = %e, "fungible asset build failed");
+                error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "fungible asset build failed");
                 mark_redemption_error(
                     relay_store_path,
                     &redemption.redemption_id,
@@ -1972,7 +1972,7 @@ async fn process_outbound_b2agg(
         let assets = match NoteAssets::new(vec![asset]) {
             Ok(a) => a,
             Err(e) => {
-                error!(redemption_id = %redemption.redemption_id, error = %e, "note assets build failed");
+                error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "note assets build failed");
                 mark_redemption_error(
                     relay_store_path,
                     &redemption.redemption_id,
@@ -2000,7 +2000,7 @@ async fn process_outbound_b2agg(
         ) {
             Ok(n) => n,
             Err(e) => {
-                error!(redemption_id = %redemption.redemption_id, error = %e, "B2AGG note build failed");
+                error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "B2AGG note build failed");
                 mark_redemption_error(
                     relay_store_path,
                     &redemption.redemption_id,
@@ -2016,7 +2016,7 @@ async fn process_outbound_b2agg(
         {
             Ok(r) => r,
             Err(e) => {
-                error!(redemption_id = %redemption.redemption_id, error = %e, "B2AGG tx-request build failed");
+                error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "B2AGG tx-request build failed");
                 mark_redemption_error(
                     relay_store_path,
                     &redemption.redemption_id,
@@ -2033,7 +2033,7 @@ async fn process_outbound_b2agg(
                 let proven = match client.prove_transaction_with(&result, prover).await {
                     Ok(p) => p,
                     Err(e) => {
-                        error!(redemption_id = %redemption.redemption_id, error = %e, "B2AGG prove failed");
+                        error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "B2AGG prove failed");
                         mark_redemption_error(
                             relay_store_path,
                             &redemption.redemption_id,
@@ -2045,7 +2045,7 @@ async fn process_outbound_b2agg(
                 let height = match client.submit_proven_transaction(proven, &result).await {
                     Ok(h) => h,
                     Err(e) => {
-                        error!(redemption_id = %redemption.redemption_id, error = %e, "B2AGG submit failed");
+                        error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "B2AGG submit failed");
                         mark_redemption_error(
                             relay_store_path,
                             &redemption.redemption_id,
@@ -2055,7 +2055,7 @@ async fn process_outbound_b2agg(
                     }
                 };
                 if let Err(e) = client.apply_transaction(&result, height).await {
-                    warn!(redemption_id = %redemption.redemption_id, error = %e, "B2AGG apply_transaction warning");
+                    warn!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "B2AGG apply_transaction warning");
                 }
                 info!(
                     redemption_id = %redemption.redemption_id,
@@ -2066,7 +2066,7 @@ async fn process_outbound_b2agg(
                 format!("{id}")
             }
             Err(e) => {
-                error!(redemption_id = %redemption.redemption_id, error = %e, "B2AGG execute failed");
+                error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "B2AGG execute failed");
                 mark_redemption_error(
                     relay_store_path,
                     &redemption.redemption_id,
@@ -2168,7 +2168,7 @@ async fn process_direct_bridge_outs(
         let asset = match FungibleAsset::new(bali_faucet, amount) {
             Ok(a) => Asset::Fungible(a),
             Err(e) => {
-                error!(request_id = %row.request_id, error = %e, "fungible asset build failed");
+                error!(request_id = %row.request_id, error = format!("{e:#}"), "fungible asset build failed");
                 mark_bridge_out_failed(
                     relay_store_path,
                     &row.request_id,
@@ -2180,7 +2180,7 @@ async fn process_direct_bridge_outs(
         let assets = match NoteAssets::new(vec![asset]) {
             Ok(a) => a,
             Err(e) => {
-                error!(request_id = %row.request_id, error = %e, "note assets build failed");
+                error!(request_id = %row.request_id, error = format!("{e:#}"), "note assets build failed");
                 mark_bridge_out_failed(
                     relay_store_path,
                     &row.request_id,
@@ -2200,7 +2200,7 @@ async fn process_direct_bridge_outs(
         ) {
             Ok(n) => n,
             Err(e) => {
-                error!(request_id = %row.request_id, error = %e, "B2AGG note build failed");
+                error!(request_id = %row.request_id, error = format!("{e:#}"), "B2AGG note build failed");
                 mark_bridge_out_failed(
                     relay_store_path,
                     &row.request_id,
@@ -2216,7 +2216,7 @@ async fn process_direct_bridge_outs(
         {
             Ok(r) => r,
             Err(e) => {
-                error!(request_id = %row.request_id, error = %e, "B2AGG tx-request build failed");
+                error!(request_id = %row.request_id, error = format!("{e:#}"), "B2AGG tx-request build failed");
                 mark_bridge_out_failed(
                     relay_store_path,
                     &row.request_id,
@@ -2233,7 +2233,7 @@ async fn process_direct_bridge_outs(
                 let proven = match client.prove_transaction_with(&result, prover).await {
                     Ok(p) => p,
                     Err(e) => {
-                        error!(request_id = %row.request_id, error = %e, "B2AGG prove failed");
+                        error!(request_id = %row.request_id, error = format!("{e:#}"), "B2AGG prove failed");
                         mark_bridge_out_failed(
                             relay_store_path,
                             &row.request_id,
@@ -2245,7 +2245,7 @@ async fn process_direct_bridge_outs(
                 let height = match client.submit_proven_transaction(proven, &result).await {
                     Ok(h) => h,
                     Err(e) => {
-                        error!(request_id = %row.request_id, error = %e, "B2AGG submit failed");
+                        error!(request_id = %row.request_id, error = format!("{e:#}"), "B2AGG submit failed");
                         mark_bridge_out_failed(
                             relay_store_path,
                             &row.request_id,
@@ -2255,7 +2255,7 @@ async fn process_direct_bridge_outs(
                     }
                 };
                 if let Err(e) = client.apply_transaction(&result, height).await {
-                    warn!(request_id = %row.request_id, error = %e, "B2AGG apply_transaction warning");
+                    warn!(request_id = %row.request_id, error = format!("{e:#}"), "B2AGG apply_transaction warning");
                 }
                 info!(
                     request_id = %row.request_id,
@@ -2266,7 +2266,7 @@ async fn process_direct_bridge_outs(
                 format!("{id}")
             }
             Err(e) => {
-                error!(request_id = %row.request_id, error = %e, "B2AGG execute failed");
+                error!(request_id = %row.request_id, error = format!("{e:#}"), "B2AGG execute failed");
                 mark_bridge_out_failed(
                     relay_store_path,
                     &row.request_id,
@@ -2419,7 +2419,7 @@ async fn process_outbound_status_b2agg(
         let resp = match http.get(&url).send().await {
             Ok(r) => r,
             Err(e) => {
-                warn!(redemption_id = %redemption_id, error = %e, "bali bridge service http failed");
+                warn!(redemption_id = %redemption_id, error = format!("{e:#}"), "bali bridge service http failed");
                 continue;
             }
         };
@@ -2430,7 +2430,7 @@ async fn process_outbound_status_b2agg(
         let body: serde_json::Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                warn!(redemption_id = %redemption_id, error = %e, "bali bridge service decode failed");
+                warn!(redemption_id = %redemption_id, error = format!("{e:#}"), "bali bridge service decode failed");
                 continue;
             }
         };
