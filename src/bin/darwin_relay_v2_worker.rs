@@ -1416,6 +1416,54 @@ struct OneClickDepositSubmitReq<'a> {
     deposit_address: &'a str,
 }
 
+// /demo/flows/outbound/submit body — the mock's outbound counterpart to
+// /v0/deposit/submit. Used by process_outbound (bridge_out_v1) after
+// the relay emits its P2ID; the mock takes senderAccountId (= the
+// bridge_account where the P2ID was sent), polls for + consumes the
+// note, then triggers its bridge solver for the Sepolia release.
+#[derive(Serialize)]
+struct DemoOutboundSubmitReq<'a> {
+    #[serde(rename = "senderAccountId")]
+    sender_account_id: &'a str,
+    asset: &'a str,
+    amount: String,
+    recipient: &'a str,
+    #[serde(rename = "refundTo")]
+    refund_to: &'a str,
+    #[serde(rename = "timeoutSecs")]
+    timeout_secs: u64,
+}
+
+// Response from /demo/flows/outbound/submit. The mock runs the full
+// outbound pipeline synchronously inside the wait window:
+// consume_note → settlement_initiated → settlement_succeeded → evm_release.
+// If timeoutSecs is large enough the response already carries the
+// final flow.status and artifacts.evmReleaseTxHashes — no need to
+// poll afterwards. Only the fields we use are typed; the rest are
+// captured opaquely under `_other` so deserialization stays forgiving
+// across mock version bumps.
+#[derive(Deserialize, Debug)]
+struct DemoOutboundSubmitResp {
+    flow: DemoFlowResp,
+    #[serde(rename = "bridgeOutNoteTxId")]
+    #[allow(dead_code)]
+    bridge_out_note_tx_id: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct DemoFlowResp {
+    #[serde(rename = "correlationId")]
+    correlation_id: String,
+    status: String,
+    artifacts: DemoFlowArtifacts,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct DemoFlowArtifacts {
+    #[serde(rename = "evmReleaseTxHashes", default)]
+    evm_release_tx_hashes: Vec<String>,
+}
+
 #[derive(Deserialize, Debug)]
 struct OneClickStatusResp {
     status: String,
@@ -1700,26 +1748,137 @@ async fn process_outbound(
             }
         };
 
-        // 3) Notify 1Click that the inbound (from its POV) is in flight.
-        let submit_url = format!("{}/v0/deposit/submit", oneclick_url.trim_end_matches('/'));
-        let submit_body = OneClickDepositSubmitReq {
-            tx_hash: &tx_hex,
-            deposit_address: &quote.quote.deposit_address,
+        // 3) Trigger the mock's outbound demo flow. The public
+        // /v0/deposit/submit handler is INBOUND-only — its
+        // get_quote_by_deposit() lookup is keyed on Sepolia deposit
+        // addresses, which we don't have for outbound. The mock's
+        // outbound rail sits under /demo/flows/outbound/submit; it
+        // takes the bridge_account (where we just shipped dETH on
+        // Miden) as senderAccountId, polls miden-client for notes
+        // targeting that account, consumes the P2ID we emitted, then
+        // hands off to the bridge solver for the Sepolia release.
+        //
+        // timeoutSecs=60 so wait_and_consume_notes returns within a
+        // reasonable tick window — the relay's P2ID is already in the
+        // mempool, so notes should be visible within a few seconds.
+        // Errors here are warn-only: the redemption is already debited
+        // off-chain and burned on-chain, so we don't roll back; the
+        // status poller picks up settlement in the next tick.
+        let submit_url = format!(
+            "{}/demo/flows/outbound/submit",
+            oneclick_url.trim_end_matches('/')
+        );
+        let relay_hex = relay_wallet.to_hex();
+        let submit_body = DemoOutboundSubmitReq {
+            sender_account_id: &memo.bridge_account_id,
+            asset: "eth",
+            amount: underlying.to_string(),
+            recipient: &redemption.user_evm_addr,
+            refund_to: &relay_hex,
+            timeout_secs: 60,
         };
         match http.post(&submit_url).json(&submit_body).send().await {
             Ok(r) if r.status().is_success() => {
-                info!(redemption_id = %redemption.redemption_id, "1Click notified of outbound");
+                match r.json::<DemoOutboundSubmitResp>().await {
+                    Ok(resp) => {
+                        info!(
+                            redemption_id = %redemption.redemption_id,
+                            demo_correlation_id = %resp.flow.correlation_id,
+                            flow_status = %resp.flow.status,
+                            release_tx_count = resp.flow.artifacts.evm_release_tx_hashes.len(),
+                            "demo outbound submitted",
+                        );
+                        // The mock's submit_outbound returns after
+                        // consuming the Miden note (~10s) — its bridge
+                        // solver releases on Sepolia ~15-30s later.
+                        // Poll /demo/flows/<id> a few times to catch
+                        // the SUCCESS while we're already mid-flight;
+                        // gives a clean atomic E2E test instead of
+                        // depending on the next-tick poller (which
+                        // would also work but spreads the visible
+                        // outcome across two cycles).
+                        let mut release_tx: Option<String> = if resp.flow.status == "SUCCESS" {
+                            resp.flow.artifacts.evm_release_tx_hashes.first().cloned()
+                        } else {
+                            None
+                        };
+                        if release_tx.is_none() {
+                            let flow_url = format!(
+                                "{}/demo/flows/{}",
+                                oneclick_url.trim_end_matches('/'),
+                                resp.flow.correlation_id,
+                            );
+                            for _ in 0..15 {
+                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                match http.get(&flow_url).send().await {
+                                    Ok(fr) if fr.status().is_success() => {
+                                        if let Ok(flow) = fr.json::<DemoFlowResp>().await {
+                                            if flow.status == "SUCCESS" {
+                                                release_tx = flow
+                                                    .artifacts
+                                                    .evm_release_tx_hashes
+                                                    .first()
+                                                    .cloned();
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if let Some(release_tx) = release_tx {
+                            if let Err(e) = mark_redemption_settled(
+                                relay_store_path,
+                                &redemption.redemption_id,
+                                &release_tx,
+                            ) {
+                                warn!(
+                                    redemption_id = %redemption.redemption_id,
+                                    error = format!("{e:#}"),
+                                    "mark_redemption_settled failed (will retry on next tick)",
+                                );
+                            } else {
+                                info!(
+                                    redemption_id = %redemption.redemption_id,
+                                    sepolia_release_tx = %release_tx,
+                                    "outbound settled on Sepolia",
+                                );
+                            }
+                        } else {
+                            warn!(
+                                redemption_id = %redemption.redemption_id,
+                                demo_correlation_id = %resp.flow.correlation_id,
+                                "outbound polled out without SUCCESS — \
+                                 mark_redemption_settled deferred to next tick poller",
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            redemption_id = %redemption.redemption_id,
+                            error = format!("{e:#}"),
+                            "demo outbound submitted but response decode failed",
+                        );
+                    }
+                }
             }
             Ok(r) => {
                 let code = r.status();
+                let body = r.text().await.unwrap_or_default();
                 warn!(
                     redemption_id = %redemption.redemption_id,
                     %code,
-                    "1Click deposit/submit non-2xx (continuing)"
+                    body = %body.chars().take(200).collect::<String>(),
+                    "demo outbound submit non-2xx (continuing)"
                 );
             }
             Err(e) => {
-                warn!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "1Click deposit/submit http failed (continuing)");
+                warn!(
+                    redemption_id = %redemption.redemption_id,
+                    error = format!("{e:#}"),
+                    "demo outbound submit http failed (continuing)"
+                );
             }
         }
 
