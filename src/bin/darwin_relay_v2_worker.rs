@@ -58,6 +58,76 @@ use serde::{Deserialize, Serialize};
 const ATOMIC_DEPOSIT_NOTE_MASM: &str = include_str!("../../asm/atomic_deposit_note.masm");
 const ATOMIC_DEPOSIT_NOTE_V2_MASM: &str =
     include_str!("../../asm/atomic_deposit_note_v2.masm");
+
+// Basket token faucet IDs on Miden testnet. The atomic_deposit_note_v2
+// script writes slot-10 at the key (user_suffix, user_prefix,
+// basket_suffix, basket_prefix); the frontend reads at the SAME key.
+// Without these, the worker pushed only 5 storage felts and the script
+// read basket_suffix/basket_prefix as 0/0 — depositing landed in a slot
+// the frontend never queries (silent zero-balance).
+//
+// Mirrors the frontend's BASKET_TOKEN_FAUCET map in
+// src/components/MidenDepositPanel.tsx. Both must stay in sync.
+fn basket_faucet_hex(symbol: &str) -> Option<&'static str> {
+    match symbol {
+        "DCC" => Some("0x2066f2da1f91ba202af5251d39101c"),
+        "DAG" => Some("0xfb6811fd6399df206d44f62800620d"),
+        "DCO" => Some("0xbe4efc6729eb3220423b7d6d6a0942"),
+        _ => None,
+    }
+}
+
+// Both the deposit asset (dETH, from the 1Click bridge) and the basket
+// tokens (DCC/DAG/DCO) are 8-decimal on Miden — so the felt scaling
+// term in `nav_scale = nav * 10000 / 10^(basket_dec - asset_dec)`
+// collapses to `nav * 10000`. When other assets bridge in (USDT 6-dec,
+// WBTC 8-dec), pass `asset_decimals` through the intent and reinstate
+// the per-decimal scaling branch that the frontend has in
+// `computeStorageFelts` (MidenDepositPanel.tsx).
+const ASSET_DECIMALS_DETH: i32 = 8;
+const BASKET_TOKEN_DECIMALS: i32 = 8;
+
+// Live constituent prices fetched from the Vercel-side /api/prices.
+// Same shape as the frontend's `PricesResponse` in lib/prices.ts.
+// Used to derive the per-basket NAV the note script needs to mint the
+// correct slot-10 credit (slot-10 is denominated in basket-token base
+// units, not deposit-asset base units).
+#[derive(Deserialize, Debug, Clone)]
+struct PricesResponse {
+    eth: f64,
+    wbtc: f64,
+    usdt: f64,
+    dai: f64,
+}
+
+async fn fetch_prices(http: &reqwest::Client) -> Result<PricesResponse> {
+    let url = std::env::var("DARWIN_RELAY_V2_PRICES_URL")
+        .unwrap_or_else(|_| "https://darwin.market/api/prices".to_string());
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .with_context(|| format!("GET {url} non-2xx"))?;
+    let body: PricesResponse = resp
+        .json()
+        .await
+        .with_context(|| format!("decode {url} as PricesResponse"))?;
+    Ok(body)
+}
+
+// Weighted NAV per basket unit. Mirrors `basketNav()` in
+// darwin-frontend/src/lib/prices.ts — weights MUST stay in sync with
+// the catalogue in darwin-frontend/src/lib/baskets.ts.
+fn basket_nav_usd(symbol: &str, p: &PricesResponse) -> Option<f64> {
+    match symbol {
+        "DCC" => Some(0.40 * p.wbtc + 0.40 * p.eth + 0.20 * p.usdt),
+        "DAG" => Some(0.50 * p.wbtc + 0.50 * p.eth),
+        "DCO" => Some(0.10 * p.wbtc + 0.10 * p.eth + 0.40 * p.usdt + 0.40 * p.dai),
+        _ => None,
+    }
+}
 const ATOMIC_REDEEM_NOTE_MASM: &str = include_str!("../../asm/atomic_redeem_note.masm");
 const MATH_MASM: &str = include_str!("../../asm/lib/math.masm");
 const BRIDGE_OUT_V1_MASM: &str = include_str!("../../asm/bridge_out_v1.masm");
@@ -431,6 +501,7 @@ async fn tick(
 
     process_deposits(
         client,
+        http,
         relay_store_path,
         relay_wallet,
         controller,
@@ -736,6 +807,7 @@ async fn drain_native_controller(
 
 async fn process_deposits(
     client: &mut miden_client::Client<FilesystemKeyStore>,
+    http: &reqwest::Client,
     relay_store_path: &str,
     relay_wallet: AccountId,
     controller: AccountId,
@@ -748,6 +820,25 @@ async fn process_deposits(
         return Ok(());
     }
     info!(count = pending.len(), "intents needing on-chain submission");
+
+    // Pull live constituent prices once per pass — every pending intent
+    // in this batch uses the same snapshot. The /api/prices endpoint is
+    // already wired to CoinGecko via Vercel; the worker doesn't need its
+    // own price feed. If the fetch fails we skip the whole pass rather
+    // than mint into a wrong slot-10 credit, since the relay's mint
+    // formula is (deposit_value * fee / nav_scale) and nav_scale is
+    // derived from the basket NAV — a stale or zero NAV produces silently
+    // huge mints (the bug we hit on 2026-06-06).
+    let prices = match fetch_prices(http).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                error = format!("{e:#}"),
+                "prices fetch failed — skipping pending intents this tick",
+            );
+            return Ok(());
+        }
+    };
 
     // Vault snapshot.
     let relay_acct = client
@@ -803,12 +894,31 @@ async fn process_deposits(
             continue;
         }
 
+        let nav_usd = match basket_nav_usd(&intent.basket_symbol, &prices) {
+            Some(n) if n > 0.0 => n,
+            _ => {
+                warn!(
+                    correlation_id = %intent.correlation_id,
+                    basket = %intent.basket_symbol,
+                    "no NAV for basket symbol — skipping",
+                );
+                mark_intent_error(
+                    relay_store_path,
+                    &intent.correlation_id,
+                    &format!("no NAV available for {}", intent.basket_symbol),
+                )?;
+                continue;
+            }
+        };
+
         match submit_atomic_deposit(
             client,
             relay_wallet,
             controller,
             deth_faucet,
             amount,
+            prices.eth,
+            nav_usd,
             note_script,
             &intent,
         )
@@ -967,6 +1077,8 @@ async fn submit_atomic_deposit(
     controller: AccountId,
     deth_faucet: AccountId,
     amount: u64,
+    asset_price_usd: f64,
+    basket_nav_usd: f64,
     note_script: &NoteScript,
     intent: &PendingIntent,
 ) -> Result<(String, String)> {
@@ -993,23 +1105,55 @@ async fn submit_atomic_deposit(
             .as_slice(),
     )?;
 
-    // Storage felts: v1 atomic_deposit_note expects
-    //   [deposit_value, fee_factor, nav_scale]
-    // The note computes the slot-10 credit as
-    //   deposit_value * fee_factor / nav_scale.
-    // We want the on-chain credit to equal the deposited base-unit
-    // amount (so it matches the off-chain RelayPositionsPanel, which
-    // credits the same ÷10^10-scaled amount). Setting nav_scale =
-    // fee_factor makes the two cancel → credit = deposit_value =
-    // amount. (The earlier nav_scale=amount made deposit_value and
-    // nav_scale cancel instead, pinning the credit to a constant
-    // 9970 regardless of deposit size — which is what diverged from
-    // the off-chain ledger.) The 30 bps redeem fee is applied on the
-    // redeem leg, not here.
-    let fee_factor = tunables().fee_factor;
-    let nav_scale = fee_factor;
+    // Storage felts: atomic_deposit_note_v2 expects 7 felts and runs
+    //   mint = deposit_value * fee_factor / nav_scale
+    // under MASM `felt_div` (integer division). We pre-pack units so
+    // the divide lands on the right basket-token base-unit count.
+    //
+    // Mirrors the frontend's `computeStorageFelts` in
+    // src/components/MidenDepositPanel.tsx — must stay in sync.
+    //
+    //   deposit_value = amount_asset_base * asset_price_usd
+    //   fee_factor    = 9970                  (0.9970 in 1e4 fp)
+    //   nav_scale     = basket_nav_usd * 10000 / 10^(basket_dec - asset_dec)
+    //
+    // For dETH (8-dec) → DCC (8-dec) at NAV $25k, amount=1000 base
+    // (0.00001 dETH @ $1547):
+    //   deposit_value = 1000 * 1547  = 1_547_000
+    //   nav_scale     = 25000 * 10000 = 250_000_000
+    //   mint = 1_547_000 * 9970 / 250_000_000 ≈ 62 base units DCC
+    //        = 0.00000062 DCC × $25000 ≈ $0.0155  ✓
+    //
+    // The prior bug used nav_scale = fee_factor (both 9970), making
+    // them cancel and pinning the slot-10 credit to `amount` (1000
+    // base units = $0.25-worth of DCC for a $0.016 deposit, an
+    // ~16× over-mint).
+    let fee_factor: u64 = 9_970;
+    let asset_price_round = asset_price_usd.round().max(1.0) as u64;
+    let deposit_value: u64 = amount.saturating_mul(asset_price_round).max(1);
+    let nav_flat: u64 = basket_nav_usd.round().max(1.0) as u64;
+    let basket_minus_asset_dec: i32 = BASKET_TOKEN_DECIMALS - ASSET_DECIMALS_DETH;
+    let mut nav_scale: u64 = nav_flat.saturating_mul(10_000);
+    if basket_minus_asset_dec > 0 {
+        let div = 10u64.pow(basket_minus_asset_dec as u32);
+        nav_scale = (nav_scale / div).max(1);
+    } else if basket_minus_asset_dec < 0 {
+        let mul = 10u64.pow((-basket_minus_asset_dec) as u32);
+        nav_scale = nav_scale.saturating_mul(mul);
+    }
+    info!(
+        correlation_id = %intent.correlation_id,
+        amount,
+        asset_price_usd,
+        basket_nav_usd,
+        deposit_value,
+        fee_factor,
+        nav_scale,
+        expected_mint = deposit_value as u128 * fee_factor as u128 / nav_scale.max(1) as u128,
+        "atomic_deposit nav math",
+    );
     let mut storage_felts = vec![
-        miden_client::Felt::new(amount),
+        miden_client::Felt::new(deposit_value),
         miden_client::Felt::new(fee_factor),
         miden_client::Felt::new(nav_scale),
     ];
@@ -1035,6 +1179,22 @@ async fn submit_atomic_deposit(
         let mask = (1u64 << 63) - 1;
         storage_felts.push(miden_client::Felt::new(user_id_suffix & mask));
         storage_felts.push(miden_client::Felt::new(user_id_prefix & mask));
+
+        // basket_id felts (slots 5,6 in note storage). The script writes
+        // slot-10 at key (user_suffix, user_prefix, basket_suffix,
+        // basket_prefix); the portfolio frontend reads with the same
+        // 4-felt key. Without these two felts the script reads them as
+        // 0/0 and the deposit lands in a slot the frontend never queries.
+        let basket_hex = basket_faucet_hex(&intent.basket_symbol).with_context(|| {
+            format!(
+                "unknown basket_symbol {:?} — add it to basket_faucet_hex()",
+                intent.basket_symbol
+            )
+        })?;
+        let basket_account = AccountId::from_hex(basket_hex)
+            .with_context(|| format!("basket_faucet_hex for {} is not parseable", intent.basket_symbol))?;
+        storage_felts.push(basket_account.suffix());
+        storage_felts.push(basket_account.prefix().as_felt());
     }
     let recipient = NoteRecipient::new(
         serial_num,
@@ -1652,6 +1812,7 @@ struct PendingIntent {
     correlation_id: String,
     user_evm_addr: String,
     amount_in_wei: String,
+    basket_symbol: String,
 }
 
 struct PendingRedemption {
@@ -1662,7 +1823,7 @@ struct PendingRedemption {
 fn load_pending_intents(store_path: &str) -> Result<Vec<PendingIntent>> {
     let conn = Connection::open(store_path)?;
     let mut stmt = conn.prepare(
-        r#"SELECT correlation_id, user_evm_addr, amount_in_wei
+        r#"SELECT correlation_id, user_evm_addr, amount_in_wei, basket_symbol
               FROM intents
               WHERE stage = 'POSITION_CREDITED'
                 AND atomic_deposit_tx IS NULL
@@ -1675,6 +1836,7 @@ fn load_pending_intents(store_path: &str) -> Result<Vec<PendingIntent>> {
             correlation_id: r.get(0)?,
             user_evm_addr: r.get(1)?,
             amount_in_wei: r.get(2)?,
+            basket_symbol: r.get(3)?,
         });
     }
     Ok(out)

@@ -9,18 +9,21 @@
 # so the on-chain controller stays the authoritative per-user total
 # rather than only reflecting the most recent deposit.
 #
-# Storage felts layout (5 felts):
+# Storage felts layout (7 felts):
 #   storage[0] = deposit_value
 #   storage[1] = fee_factor
 #   storage[2] = nav_scale
-#   storage[3] = user_id_suffix       (felt)
-#   storage[4] = user_id_prefix       (felt)
+#   storage[3] = user_id_suffix       (felt — low 64 bits of user EVM/Account id)
+#   storage[4] = user_id_prefix       (felt — high 64 bits of user EVM/Account id)
+#   storage[5] = basket_id_suffix     (felt — low 64 bits of basket-token faucet AccountId)
+#   storage[6] = basket_id_prefix     (felt — high 64 bits of basket-token faucet AccountId)
 #
-# The basket_id used as the second half of the user_basket_key is
-# derived from the asset's faucet id (not from storage) — that's the
-# faucet that the note brought into the controller. The note script
-# reads the faucet id from the first asset's vault key while looping
-# through `drain_assets_into_controller`.
+# basket_id is what makes the slot-10 map key per-(user, basket) instead
+# of per-user-only — without it every basket row in the portfolio reads
+# the same slot and shows the same balance, which is wrong when DCC/DAG/DCO
+# share a single fee-routing controller. Derived from the basket faucet's
+# own AccountId so the discriminator is canonical (matches the frontend
+# read in midenController.ts: buildUserPositionScriptFromFelts).
 #
 # Requires v5 controller (procedures @ MAST roots below).
 
@@ -117,13 +120,16 @@ proc write_user_position
     # script returns at depth > 16 and the kernel rejects the consume
     # ("stack depth must be 16").
     # Read with the SAME key word the set sequence writes below:
-    # [0, 0, prefix, suffix] (top-down). get_map_item and set_map_item
-    # take the key in the same order, so the read MUST mirror the write.
-    # (The frontend's [suffix, prefix, 0, 0] ordering targets a different
-    # key — which is why on-chain reads came back empty.)
+    # [basket_prefix, basket_suffix, user_prefix, user_suffix] (top-down).
+    # get_map_item and set_map_item take the key in the same order, so the
+    # read MUST mirror the write. Reading basket_id from storage (was push.0
+    # push.0) makes the read land on the per-(user, basket) slot the write
+    # actually targets — without it every basket reads the same (user, 0, 0)
+    # slot and shows the same balance.
     push.103 mem_load                  # user_id_suffix
     push.104 mem_load                  # user_id_prefix
-    push.0 push.0                      # [0, 0, prefix, suffix]
+    push.105 mem_load                  # basket_id_suffix  (was push.0)
+    push.106 mem_load                  # basket_id_prefix  (was push.0)
     call.0xc9ccec5458661be113ea48c9d8947d10bfe4705a53a7aeee76c273733f88bf38
     exec.sys::truncate_stack           # value word on top, depth 16
 
@@ -133,15 +139,14 @@ proc write_user_position
     mem_load.200                       # [mint_amount, cur_amount, ...]
     add                                # [total, ...]
 
-    # --- write the new total back (original set sequence, verbatim) ---
+    # --- write the new total back (basket_id read from storage) ---
     push.103 mem_load                  # user_id_suffix
     push.104 mem_load                  # user_id_prefix
-    # basket_id = (0, 0); discriminator is implicit in the targeted
-    # controller. a future iteration adds a second basket field for multi-basket.
-    push.0 push.0
-    # Stack: [0, 0, user_id_prefix, user_id_suffix, total, ...]
+    push.105 mem_load                  # basket_id_suffix
+    push.106 mem_load                  # basket_id_prefix
+    # Stack: [basket_prefix, basket_suffix, user_prefix, user_suffix, total, ...]
     # set_map_item expects the KEY word in stack-bottom order:
-    # [user_id_suffix, user_id_prefix, 0, 0, ...] → matches.
+    # [user_suffix, user_prefix, basket_suffix, basket_prefix] → matches.
     movup.4                            # [total, key(4), ...]
     push.0 push.0 push.0               # [0, 0, 0, total, key(4), ...]
     swapw                              # [key(4), value(4), ...]
