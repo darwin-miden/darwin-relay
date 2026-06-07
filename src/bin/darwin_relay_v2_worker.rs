@@ -1777,7 +1777,94 @@ async fn process_outbound(
             refund_to: &relay_hex,
             timeout_secs: 60,
         };
-        match http.post(&submit_url).json(&submit_body).send().await {
+        // Retry on 5xx + network errors. The mock returns 500 on
+        // transient conditions that resolve on their own — sqlx pool
+        // exhaustion under load, miden-client RPC blips inside the
+        // mock's wait_and_consume_notes, race conditions where the
+        // mock starts polling before our P2ID propagates ("note
+        // relevance check failed"). Without retry, a single transient
+        // 500 strands the redemption at SETTLED forever: the dETH
+        // ship-out is already on Miden but no Sepolia release ever
+        // follows. 4xx is permanent (validation, bad request), don't
+        // retry.
+        //
+        // Backoff 2s, 5s, 10s = 17s worst-case extra wait. The mock's
+        // typical recovery on pool/RPC blip is sub-second; "note
+        // relevance" takes a few seconds for the P2ID to land in the
+        // mock's view. 3 retries covers all three failure classes.
+        const RETRY_DELAYS_SECS: [u64; 3] = [2, 5, 10];
+        let mut final_resp: Option<reqwest::Response> = None;
+        let mut final_err_summary: Option<String> = None;
+        for attempt in 0u8..4 {
+            match http.post(&submit_url).json(&submit_body).send().await {
+                Ok(r) if r.status().is_success() => {
+                    final_resp = Some(r);
+                    if attempt > 0 {
+                        info!(
+                            redemption_id = %redemption.redemption_id,
+                            attempt,
+                            "demo outbound submit recovered after retry",
+                        );
+                    }
+                    break;
+                }
+                Ok(r) => {
+                    let code = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    let body_truncated: String = body.chars().take(200).collect();
+                    if !code.is_server_error() {
+                        // 4xx is permanent — body shape mismatch, bad
+                        // sender_account_id, etc. No point retrying.
+                        final_err_summary = Some(format!(
+                            "{code} (permanent, no retry): {body_truncated}"
+                        ));
+                        break;
+                    }
+                    let summary = format!("{code}: {body_truncated}");
+                    if attempt as usize >= RETRY_DELAYS_SECS.len() {
+                        final_err_summary = Some(format!("{summary} (retries exhausted)"));
+                        break;
+                    }
+                    let backoff = RETRY_DELAYS_SECS[attempt as usize];
+                    warn!(
+                        redemption_id = %redemption.redemption_id,
+                        attempt,
+                        %code,
+                        backoff_secs = backoff,
+                        "demo outbound submit 5xx — backing off and retrying",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                }
+                Err(e) => {
+                    let summary = format!("network: {e:#}");
+                    if attempt as usize >= RETRY_DELAYS_SECS.len() {
+                        final_err_summary = Some(format!("{summary} (retries exhausted)"));
+                        break;
+                    }
+                    let backoff = RETRY_DELAYS_SECS[attempt as usize];
+                    warn!(
+                        redemption_id = %redemption.redemption_id,
+                        attempt,
+                        error = format!("{e:#}"),
+                        backoff_secs = backoff,
+                        "demo outbound submit HTTP error — backing off and retrying",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                }
+            }
+        }
+        // Map back into the original match shape: Ok(Response) on success,
+        // synthetic Err on all-attempts-failed so the existing warn path
+        // still fires with a useful error summary.
+        let attempt_result: Result<reqwest::Response, std::io::Error> = match final_resp {
+            Some(r) => Ok(r),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                final_err_summary
+                    .unwrap_or_else(|| "demo outbound submit failed (no diagnostic)".to_string()),
+            )),
+        };
+        match attempt_result {
             Ok(r) if r.status().is_success() => {
                 match r.json::<DemoOutboundSubmitResp>().await {
                     Ok(resp) => {
