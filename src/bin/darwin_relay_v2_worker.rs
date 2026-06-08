@@ -549,7 +549,17 @@ async fn tick(
                 bridge_out_script,
             )
             .await?;
+            // process_outbound_status polls /v0/status which is
+            // inbound-only on the mock, so it's a no-op for outbound
+            // flows. Kept as a placeholder for the future case where
+            // the mock exposes a public outbound status endpoint.
             process_outbound_status(relay_store_path, oneclick_url, http).await?;
+            // The actual recovery for outbound flows is the sepolia
+            // reaper — re-polls /demo/flows/<correlationId> for
+            // SETTLED-without-sepolia redemptions whose inline poll
+            // missed the SUCCESS window. Every tick = one extra
+            // chance to catch the bridge solver's release tx.
+            process_sepolia_reaper(relay_store_path, oneclick_url, http).await?;
         }
         other => {
             warn!(mode = %other, "unknown outbound mode — falling back to b2agg");
@@ -1925,10 +1935,19 @@ async fn process_outbound(
                     .unwrap_or_else(|| "demo outbound submit failed (no diagnostic)".to_string()),
             )),
         };
+        // Capture the demo flow's correlation_id when the submit
+        // succeeds (the mock creates a NEW quote internally so this is
+        // distinct from `quote.correlation_id` — the relay's outbound
+        // /v0/quote correlation that drove the P2ID emit). The reaper
+        // (process_sepolia_reaper) reads it from oneclick_correlation_id
+        // to GET /demo/flows/<id> on the next tick for any redemption
+        // whose inline poll missed SUCCESS.
+        let mut demo_flow_correlation_id: Option<String> = None;
         match attempt_result {
             Ok(r) if r.status().is_success() => {
                 match r.json::<DemoOutboundSubmitResp>().await {
                     Ok(resp) => {
+                        demo_flow_correlation_id = Some(resp.flow.correlation_id.clone());
                         info!(
                             redemption_id = %redemption.redemption_id,
                             demo_correlation_id = %resp.flow.correlation_id,
@@ -2032,14 +2051,139 @@ async fn process_outbound(
 
         // 4) Persist. Legacy 1Click path doesn't go through the
         // canonical Bali bridge, so no baseline_cnt is meaningful.
+        // Prefer the demo flow's correlation_id when the submit
+        // succeeded — that's the ID the reaper polls. Falls back to
+        // the relay's outbound /v0/quote correlation when the submit
+        // never made it (older flows or all-attempts-failed cases);
+        // the reaper will skip those (no demo flow to query).
+        let persisted_correlation_id = demo_flow_correlation_id
+            .as_deref()
+            .unwrap_or(&quote.correlation_id);
         mark_redemption_outbound(
             relay_store_path,
             &redemption.redemption_id,
             &tx_hex,
-            &quote.correlation_id,
+            persisted_correlation_id,
             &quote.quote.deposit_address,
             None,
         )?;
+    }
+    Ok(())
+}
+
+/// Reaper that catches redemptions whose demo outbound submit succeeded
+/// but whose inline poll on /demo/flows/<id> timed out before the mock's
+/// bridge solver flipped the flow to SUCCESS (typically 60-90s after
+/// the submit, which the inline 45s budget doesn't always cover).
+///
+/// Queries redemptions in SETTLED-without-sepolia state that have a
+/// stored demo correlation_id (`oneclick_correlation_id` column),
+/// re-fetches `/demo/flows/<id>` once per tick, and marks them
+/// FULLY_SETTLED if status=SUCCESS with a non-empty
+/// `evmReleaseTxHashes`. Redemptions that never reached the demo
+/// submit step (bridge crash before quote, /v0/quote retries
+/// exhausted, etc.) have no correlation_id and are left alone — the
+/// auto-recovered branch already re-credited those off-chain.
+///
+/// Safe to call every tick: idempotent SQL (only writes when the flow
+/// is SUCCESS), bounded query (LIMIT 32 keeps the per-tick HTTP fan-out
+/// small under unusual load).
+async fn process_sepolia_reaper(
+    relay_store_path: &str,
+    oneclick_url: &str,
+    http: &reqwest::Client,
+) -> Result<()> {
+    let pending: Vec<(String, String)> = {
+        let conn = Connection::open(relay_store_path)?;
+        let mut stmt = conn.prepare(
+            r#"SELECT redemption_id, oneclick_correlation_id
+                  FROM redemptions
+                  WHERE stage = 'SETTLED'
+                    AND (sepolia_release_tx IS NULL OR sepolia_release_tx = '')
+                    AND oneclick_correlation_id IS NOT NULL
+                    AND oneclick_correlation_id != ''
+                  ORDER BY updated_at DESC
+                  LIMIT 32"#,
+        )?;
+        let mut rows = stmt.query(params![])?;
+        let mut out = vec![];
+        while let Some(r) = rows.next()? {
+            out.push((r.get::<_, String>(0)?, r.get::<_, String>(1)?));
+        }
+        out
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+    info!(count = pending.len(), "sepolia reaper: polling /demo/flows for SETTLED-without-sepolia redemptions");
+    for (rid, demo_cid) in pending {
+        let flow_url = format!(
+            "{}/demo/flows/{}",
+            oneclick_url.trim_end_matches('/'),
+            demo_cid,
+        );
+        match http.get(&flow_url).send().await {
+            Ok(r) if r.status().is_success() => {
+                match r.json::<DemoFlowResp>().await {
+                    Ok(flow) => {
+                        if flow.status == "SUCCESS" {
+                            if let Some(release_tx) =
+                                flow.artifacts.evm_release_tx_hashes.first()
+                            {
+                                if let Err(e) = mark_redemption_settled(
+                                    relay_store_path,
+                                    &rid,
+                                    release_tx,
+                                ) {
+                                    warn!(
+                                        rid = %rid,
+                                        error = format!("{e:#}"),
+                                        "sepolia reaper: mark_redemption_settled failed",
+                                    );
+                                } else {
+                                    info!(
+                                        rid = %rid,
+                                        demo_correlation_id = %demo_cid,
+                                        sepolia_release_tx = %release_tx,
+                                        "sepolia reaper: outbound settled on Sepolia",
+                                    );
+                                }
+                            } else {
+                                warn!(
+                                    rid = %rid,
+                                    demo_correlation_id = %demo_cid,
+                                    "sepolia reaper: flow SUCCESS but evmReleaseTxHashes empty",
+                                );
+                            }
+                        }
+                        // PENDING_DEPOSIT / PROCESSING / KNOWN_DEPOSIT_TX:
+                        // leave for next reaper tick. REFUNDED / FAILED:
+                        // we currently don't transition the redemption
+                        // back to errored from here — the burn-leg has
+                        // landed on-chain and the right move is operator
+                        // attention, not silent rollback. Surface a warn
+                        // so the operator notices.
+                        else if flow.status == "REFUNDED" || flow.status == "FAILED" {
+                            warn!(
+                                rid = %rid,
+                                demo_correlation_id = %demo_cid,
+                                flow_status = %flow.status,
+                                "sepolia reaper: mock terminal status — needs operator attention",
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(rid = %rid, error = format!("{e:#}"), "sepolia reaper: flow decode failed");
+                    }
+                }
+            }
+            Ok(r) => {
+                warn!(rid = %rid, code = %r.status(), "sepolia reaper: /demo/flows non-2xx");
+            }
+            Err(e) => {
+                warn!(rid = %rid, error = format!("{e:#}"), "sepolia reaper: /demo/flows http failed");
+            }
+        }
     }
     Ok(())
 }
