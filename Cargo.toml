@@ -142,3 +142,12 @@ name              = "darwin_relay_v2_worker"
 path              = "src/bin/darwin_relay_v2_worker.rs"
 required-features = ["v2-worker"]
 
+# CLI test harness for the Miden-native deposit path (the same shape
+# the frontend MidenDepositPanel exercises in the browser). Reuses the
+# v2-worker feature set since it needs the full miden-client +
+# assembler stack to compile the v2 MASM in-process.
+[[bin]]
+name              = "miden_native_deposit_test"
+path              = "src/bin/miden_native_deposit_test.rs"
+required-features = ["v2-worker"]
+
