@@ -180,7 +180,7 @@ fn tunables() -> &'static Tunables {
 // worker emits (receive_asset + set_user_position), the MAST roots
 // are byte-identical to v5; only the get_* read procs differ. Older
 // deploys can still be targeted via the CLI override.
-const DEFAULT_CONTROLLER_HEX: &str = "0x2a3ea0a268d97b80497d6a966e3141";
+const DEFAULT_CONTROLLER_HEX: &str = "0xbef7d2e89e9c3e006e10f959fa16d2";
 
 // "Native" controller — the controller the frontend targets when a
 // user emits a deposit note directly from their Miden wallet (no
@@ -195,7 +195,7 @@ const DEFAULT_CONTROLLER_HEX: &str = "0x2a3ea0a268d97b80497d6a966e3141";
 // that credits the user's slot — independently of `process_deposits`
 // which only handles relay-tracked intents. Set the env var to the
 // empty string to disable native-side polling.
-const DEFAULT_NATIVE_CONTROLLER_HEX: &str = "0x2a3ea0a268d97b80497d6a966e3141";
+const DEFAULT_NATIVE_CONTROLLER_HEX: &str = "0xbef7d2e89e9c3e006e10f959fa16d2";
 // Miden testnet dETH faucet (the M1 deth-equivalent fungible faucet
 // the basket controllers know about). The 1Click bridge mints
 // `miden-testnet:eth` from a single faucet at runtime — the relay

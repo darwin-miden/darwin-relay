@@ -57,7 +57,7 @@ const ATOMIC_DEPOSIT_NOTE_V2_MASM: &str =
     include_str!("../../asm/atomic_deposit_note_v2.masm");
 const MATH_MASM: &str = include_str!("../../asm/lib/math.masm");
 
-const DEFAULT_CONTROLLER_HEX: &str = "0x2a3ea0a268d97b80497d6a966e3141";
+const DEFAULT_CONTROLLER_HEX: &str = "0xbef7d2e89e9c3e006e10f959fa16d2";
 // dETH faucet post 2026-06-08 bridge reseed. Override via env when the
 // mock is reseeded again.
 const DEFAULT_DETH_FAUCET_HEX: &str = "0x3063d8a9be0394a074c806d86ab776";
