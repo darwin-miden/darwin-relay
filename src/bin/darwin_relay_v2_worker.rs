@@ -1553,30 +1553,91 @@ async fn process_outbound(
             recipient_type: "DESTINATION_CHAIN",
             deadline: "2027-01-01T00:00:00Z",
         };
+        // /v0/quote also flakes on transient bridge mock conditions
+        // (container restart mid-call, sqlx pool blip). Without retry,
+        // a quote failure here error-marks the redemption AND
+        // auto-recovers (re-credits the position off-chain) — but the
+        // atomic_redeem burn has already happened on-chain, so the
+        // basket-token supply diverges from the off-chain ledger by
+        // the burn amount. Same retry shape as the demo outbound
+        // submit below: 4xx is permanent, 5xx + network are retried
+        // with 2s/5s/10s backoff (~17s total budget). When the budget
+        // exhausts, fall through to the existing error path (sunk
+        // burn is the cost of a stranded mock).
         let url = format!("{}/v0/quote", oneclick_url.trim_end_matches('/'));
-        let resp = match http.post(&url).json(&quote_req).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                error!(redemption_id = %redemption.redemption_id, error = format!("{e:#}"), "1Click quote http failed");
+        const QUOTE_RETRY_DELAYS_SECS: [u64; 3] = [2, 5, 10];
+        let mut quote_resp: Option<reqwest::Response> = None;
+        let mut quote_err_summary: Option<String> = None;
+        for attempt in 0u8..4 {
+            match http.post(&url).json(&quote_req).send().await {
+                Ok(r) if r.status().is_success() => {
+                    quote_resp = Some(r);
+                    if attempt > 0 {
+                        info!(
+                            redemption_id = %redemption.redemption_id,
+                            attempt,
+                            "1Click quote recovered after retry",
+                        );
+                    }
+                    break;
+                }
+                Ok(r) => {
+                    let code = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    let body_truncated: String = body.chars().take(200).collect();
+                    if !code.is_server_error() {
+                        quote_err_summary =
+                            Some(format!("{code} (permanent, no retry): {body_truncated}"));
+                        break;
+                    }
+                    if attempt as usize >= QUOTE_RETRY_DELAYS_SECS.len() {
+                        quote_err_summary =
+                            Some(format!("{code}: {body_truncated} (retries exhausted)"));
+                        break;
+                    }
+                    let backoff = QUOTE_RETRY_DELAYS_SECS[attempt as usize];
+                    warn!(
+                        redemption_id = %redemption.redemption_id,
+                        attempt,
+                        %code,
+                        backoff_secs = backoff,
+                        "1Click quote 5xx — backing off and retrying",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                }
+                Err(e) => {
+                    if attempt as usize >= QUOTE_RETRY_DELAYS_SECS.len() {
+                        quote_err_summary = Some(format!(
+                            "network: {e:#} (retries exhausted)"
+                        ));
+                        break;
+                    }
+                    let backoff = QUOTE_RETRY_DELAYS_SECS[attempt as usize];
+                    warn!(
+                        redemption_id = %redemption.redemption_id,
+                        attempt,
+                        error = format!("{e:#}"),
+                        backoff_secs = backoff,
+                        "1Click quote HTTP error — backing off and retrying",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                }
+            }
+        }
+        let resp = match quote_resp {
+            Some(r) => r,
+            None => {
+                let err = quote_err_summary
+                    .unwrap_or_else(|| "1Click quote failed (no diagnostic)".to_string());
+                error!(redemption_id = %redemption.redemption_id, %err, "1Click quote http failed");
                 mark_redemption_error(
                     relay_store_path,
                     &redemption.redemption_id,
-                    &format!("1Click quote http: {e}"),
+                    &format!("1Click quote http: {err}"),
                 )?;
                 continue;
             }
         };
-        if !resp.status().is_success() {
-            let code = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            error!(redemption_id = %redemption.redemption_id, %code, %body, "1Click quote non-2xx");
-            mark_redemption_error(
-                relay_store_path,
-                &redemption.redemption_id,
-                &format!("1Click quote {code}: {}", body.chars().take(200).collect::<String>()),
-            )?;
-            continue;
-        }
         let quote: OneClickQuoteResp = match resp.json().await {
             Ok(q) => q,
             Err(e) => {
