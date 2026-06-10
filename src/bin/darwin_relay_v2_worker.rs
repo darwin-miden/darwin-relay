@@ -77,13 +77,11 @@ fn basket_faucet_hex(symbol: &str) -> Option<&'static str> {
     }
 }
 
-// Both the deposit asset (dETH, from the 1Click bridge) and the basket
-// tokens (DCC/DAG/DCO) are 8-decimal on Miden — so the felt scaling
-// term in `nav_scale = nav * 10000 / 10^(basket_dec - asset_dec)`
-// collapses to `nav * 10000`. When other assets bridge in (USDT 6-dec,
-// WBTC 8-dec), pass `asset_decimals` through the intent and reinstate
-// the per-decimal scaling branch that the frontend has in
-// `computeStorageFelts` (MidenDepositPanel.tsx).
+// Default deposit-asset decimals (dETH, 8-dec). Overridable via
+// `DARWIN_RELAY_V2_ASSET_DECIMALS` so we can swap the source asset
+// (e.g. to Epoch's dUSDC) without recompiling. Basket tokens stay 8-dec
+// and so does the scaling formula `nav_scale = nav * 10000 /
+// 10^(basket_dec - asset_dec)`.
 const ASSET_DECIMALS_DETH: i32 = 8;
 const BASKET_TOKEN_DECIMALS: i32 = 8;
 
@@ -149,6 +147,16 @@ struct Tunables {
     /// amount, and by the status poller to match Bali claims to
     /// in-flight redemptions.
     redeem_fee_net_bps: u64,
+    /// Optional override for the deposit-asset USD price. When `Some`,
+    /// every intent in this worker uses this value instead of
+    /// `prices.eth` (the default which assumes dETH-denominated
+    /// deposits). Set to 1.0 when the bridge ships USD-pegged assets
+    /// like Epoch's dUSDC; leave unset for the legacy 1Click dETH path.
+    asset_price_usd_override: Option<f64>,
+    /// Deposit-asset decimals on the Miden side (default 8). Overridable
+    /// for non-8-dec faucets like Epoch's test dUSDC; flows into the
+    /// `nav_scale = nav * 10000 / 10^(basket_dec - asset_dec)` term.
+    asset_decimals: i32,
 }
 
 fn tunables() -> &'static Tunables {
@@ -165,11 +173,19 @@ fn tunables() -> &'static Tunables {
             redeem_fee_net_bps: std::env::var("DARWIN_RELAY_V2_REDEEM_FEE_NET_BPS")
                 .ok().and_then(|s| s.parse().ok())
                 .unwrap_or(9_970),
+            asset_price_usd_override: std::env::var("DARWIN_RELAY_V2_ASSET_PRICE_USD")
+                .ok().and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0),
+            asset_decimals: std::env::var("DARWIN_RELAY_V2_ASSET_DECIMALS")
+                .ok().and_then(|s| s.parse().ok())
+                .unwrap_or(ASSET_DECIMALS_DETH),
         };
         info!(
             wei_per_miden_base = t.wei_per_miden_base,
             fee_factor = t.fee_factor,
             redeem_fee_net_bps = t.redeem_fee_net_bps,
+            asset_price_usd_override = ?t.asset_price_usd_override,
+            asset_decimals = t.asset_decimals,
             "tunables loaded",
         );
         t
@@ -921,13 +937,18 @@ async fn process_deposits(
             }
         };
 
+        // Use the configured asset price when set (Epoch dUSDC path);
+        // otherwise fall back to the live ETH price (legacy 1Click dETH).
+        let asset_price_usd = tunables()
+            .asset_price_usd_override
+            .unwrap_or(prices.eth);
         match submit_atomic_deposit(
             client,
             relay_wallet,
             controller,
             deth_faucet,
             amount,
-            prices.eth,
+            asset_price_usd,
             nav_usd,
             note_script,
             &intent,
@@ -1144,7 +1165,7 @@ async fn submit_atomic_deposit(
     let asset_price_round = asset_price_usd.round().max(1.0) as u64;
     let deposit_value: u64 = amount.saturating_mul(asset_price_round).max(1);
     let nav_flat: u64 = basket_nav_usd.round().max(1.0) as u64;
-    let basket_minus_asset_dec: i32 = BASKET_TOKEN_DECIMALS - ASSET_DECIMALS_DETH;
+    let basket_minus_asset_dec: i32 = BASKET_TOKEN_DECIMALS - tunables().asset_decimals;
     let mut nav_scale: u64 = nav_flat.saturating_mul(10_000);
     if basket_minus_asset_dec > 0 {
         let div = 10u64.pow(basket_minus_asset_dec as u32);
