@@ -2313,10 +2313,19 @@ struct PendingRedemption {
 
 fn load_pending_intents(store_path: &str) -> Result<Vec<PendingIntent>> {
     let conn = Connection::open(store_path)?;
+    // The legacy 1Click flow advances stages QUOTED → KNOWN_DEPOSIT_TX
+    // → PROCESSING → ONECLICK_SUCCESS → POSITION_CREDITED via the HTTP
+    // server's polling loop, so the worker only had to process
+    // POSITION_CREDITED. The Epoch path skips that chain: the user
+    // signs once on Sepolia, Epoch's solver delivers dUSDC directly to
+    // the relay wallet, and the intent stays at KNOWN_DEPOSIT_TX
+    // forever. Including KNOWN_DEPOSIT_TX here lets the worker take
+    // over from vault-snapshot directly — under-funded intents simply
+    // leave for the next tick, matching legacy 1Click semantics.
     let mut stmt = conn.prepare(
         r#"SELECT correlation_id, user_evm_addr, amount_in_wei, basket_symbol
               FROM intents
-              WHERE stage = 'POSITION_CREDITED'
+              WHERE stage IN ('POSITION_CREDITED', 'KNOWN_DEPOSIT_TX')
                 AND atomic_deposit_tx IS NULL
               ORDER BY created_at ASC"#,
     )?;
@@ -2351,11 +2360,20 @@ fn mark_intent_submitted(
     // worker's number is authoritative because it matches what the
     // controller's slot-10 actually credited (deposit_value *
     // fee_factor / nav_scale).
+    // Bump KNOWN_DEPOSIT_TX → POSITION_CREDITED for the Epoch path —
+    // the legacy 1Click flow already advanced past the 1Click stages
+    // via the HTTP server's poll before we hit this point, so only the
+    // Epoch path needs this transition. Leave POSITION_CREDITED in
+    // place if it's already there.
     conn.execute(
         r#"UPDATE intents
               SET atomic_deposit_tx    = ?2,
                   miden_consume_tx     = ?3,
                   basket_amount_minted = ?4,
+                  stage                = CASE WHEN stage = 'KNOWN_DEPOSIT_TX'
+                                              THEN 'POSITION_CREDITED'
+                                              ELSE stage
+                                         END,
                   updated_at           = ?5
               WHERE correlation_id = ?1"#,
         params![
