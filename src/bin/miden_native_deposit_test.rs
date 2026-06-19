@@ -177,10 +177,20 @@ async fn main() -> Result<()> {
     println!("  faucet:    {deth_faucet_hex}");
     println!();
 
-    println!("Connecting to Miden testnet…");
+    let endpoint = match std::env::var("MIDEN_NETWORK")
+        .ok()
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("devnet") => miden_client::rpc::Endpoint::devnet(),
+        Some("localhost") | Some("local") => miden_client::rpc::Endpoint::localhost(),
+        _ => miden_client::rpc::Endpoint::testnet(),
+    };
+    println!("Connecting to Miden ({endpoint:?})…");
     let store = SqliteStore::new(store_path).await?;
     let mut client = ClientBuilder::<FilesystemKeyStore>::new()
-        .grpc_client(&miden_client::rpc::Endpoint::testnet(), None)
+        .grpc_client(&endpoint, None)
         .store(Arc::new(store))
         .filesystem_keystore(keystore_path)?
         .build()

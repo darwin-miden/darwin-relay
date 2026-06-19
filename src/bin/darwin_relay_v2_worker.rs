@@ -346,8 +346,22 @@ async fn main() -> Result<()> {
         .build()?;
 
     let store = SqliteStore::new(PathBuf::from(&miden_store)).await?;
+    // v0.15: read MIDEN_NETWORK from env (devnet | localhost | testnet)
+    // so the same binary points at Devnet on the migration branch and
+    // testnet on production without code changes.
+    let endpoint = match std::env::var("MIDEN_NETWORK")
+        .ok()
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("devnet") => miden_client::rpc::Endpoint::devnet(),
+        Some("localhost") | Some("local") => miden_client::rpc::Endpoint::localhost(),
+        _ => miden_client::rpc::Endpoint::testnet(),
+    };
+    tracing::info!(endpoint = ?endpoint, "miden RPC endpoint resolved");
     let mut client = ClientBuilder::<FilesystemKeyStore>::new()
-        .grpc_client(&miden_client::rpc::Endpoint::testnet(), None)
+        .grpc_client(&endpoint, None)
         .store(Arc::new(store))
         .filesystem_keystore(PathBuf::from(&miden_keystore))?
         .build()
