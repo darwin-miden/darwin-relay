@@ -36,7 +36,7 @@ use miden_client::asset::{Asset, FungibleAsset};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::{
-    Note, NoteAssets, NoteAttachment, NoteMetadata, NoteRecipient, NoteScript, NoteStorage,
+    Note, NoteAssets, NoteRecipient, NoteScript, NoteStorage,
     NoteTag, NoteType,
 };
 use miden_client::transaction::TransactionRequestBuilder;
@@ -871,10 +871,24 @@ async fn process_deposits(
         .get_account(relay_wallet)
         .await?
         .with_context(|| format!("relay wallet {} not in store", relay_wallet.to_hex()))?;
-    let mut vault_balance = relay_acct
-        .vault()
-        .get_balance(deth_faucet)
-        .unwrap_or(0);
+    // v0.15: vault.get_balance takes AssetVaultKey (not raw AccountId)
+    // and returns Result<AssetAmount, AssetError> (not Option<u64>).
+    // We're only ever asking about fungible faucets so build the key
+    // via FungibleAsset::new(faucet, 0), then convert the AssetAmount
+    // back to u64 at the boundary so the downstream comparison /
+    // subtraction logic keeps working on plain ints.
+    let mut vault_balance: u64 = {
+        let key = miden_client::asset::FungibleAsset::new(deth_faucet, 0)
+            .map(|fa| fa.vault_key());
+        match key {
+            Ok(k) => relay_acct
+                .vault()
+                .get_balance(k)
+                .map(u64::from)
+                .unwrap_or(0),
+            Err(_) => 0,
+        }
+    };
     info!(
         relay_wallet = %relay_wallet.to_hex(),
         faucet = %deth_faucet.to_hex(),
@@ -1089,11 +1103,14 @@ fn pick_basket_faucet(
     relay_acct: &miden_client::account::Account,
     min_amount: u64,
 ) -> Option<AccountId> {
+    // v0.15: `FungibleAsset::amount()` returns `AssetAmount` (newtype)
+    // not raw u64. Convert to u64 at the boundary so the rest of this
+    // function compares against u64::min_amount as before.
     let mut candidates: Vec<(AccountId, u64)> = relay_acct
         .vault()
         .assets()
         .filter_map(|a| match a {
-            Asset::Fungible(fa) => Some((fa.faucet_id(), fa.amount())),
+            Asset::Fungible(fa) => Some((fa.faucet_id(), u64::from(fa.amount()))),
             Asset::NonFungible(_) => None,
         })
         .filter(|(_, amt)| *amt >= min_amount)
@@ -1122,7 +1139,7 @@ async fn submit_atomic_deposit(
     // Relay wallet is the note sender; the controller consumes it in
     // step 2 below (same shape as flow_a_full), which runs the note
     // script and credits slot-10.
-    let metadata = NoteMetadata::new(relay_wallet, NoteType::Public);
+    let metadata = miden_client::note::PartialNoteMetadata::new(relay_wallet, NoteType::Public);
 
     let mut serial_bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut serial_bytes);
@@ -1327,7 +1344,7 @@ async fn submit_atomic_redeem(
     // the burned MAST root inside the note script — sender metadata
     // stays the relay wallet so the basket-tokens originate from there.
     let _ = controller;
-    let metadata = NoteMetadata::new(relay_wallet, NoteType::Public);
+    let metadata = miden_client::note::PartialNoteMetadata::new(relay_wallet, NoteType::Public);
 
     let mut serial_bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut serial_bytes);
@@ -1348,7 +1365,7 @@ async fn submit_atomic_redeem(
     // 9970/10000 = 99.7% net of the 30 bps redeem fee (env-tunable).
     let storage_felts = vec![
         miden_client::Felt::new(amount).expect("bounded by NAV math"),
-        miden_client::Felt::new(tunables().redeem_fee_net_bps),
+        miden_client::Felt::new(tunables().redeem_fee_net_bps).expect("bounded"),
         miden_client::Felt::new(1).expect("bounded by NAV math"),
     ];
     let recipient = NoteRecipient::new(
@@ -1534,7 +1551,15 @@ async fn process_outbound(
         .get_account(relay_wallet)
         .await?
         .with_context(|| format!("relay wallet {} not in store", relay_wallet.to_hex()))?;
-    let vault_balance = relay_acct.vault().get_balance(oneclick_faucet).unwrap_or(0);
+    // v0.15 vault.get_balance: takes AssetVaultKey, returns
+    // Result<AssetAmount>. Same boundary conversion as the inbound
+    // snapshot at process_pending_intents.
+    let vault_balance: u64 = miden_client::asset::FungibleAsset::new(oneclick_faucet, 0)
+        .map(|fa| fa.vault_key())
+        .ok()
+        .and_then(|k| relay_acct.vault().get_balance(k).ok())
+        .map(u64::from)
+        .unwrap_or(0);
     info!(
         relay_wallet = %relay_wallet.to_hex(),
         oneclick_faucet = %oneclick_faucet.to_hex(),
@@ -1722,11 +1747,20 @@ async fn process_outbound(
                 continue;
             }
         };
+        // v0.15: `Felt::new(u64)` returns `Result<Felt, FeltFromIntError>`.
+        // Parse + felt-build then flatten the nested Result.
         let storage_felts: Vec<miden_client::Felt> = match memo
             .storage
             .storage_items
             .iter()
-            .map(|s| s.parse::<u64>().map(miden_client::Felt::new))
+            .map(|s| {
+                s.parse::<u64>()
+                    .map_err(|e| anyhow::anyhow!("parse u64: {e}"))
+                    .and_then(|v| {
+                        miden_client::Felt::new(v)
+                            .map_err(|e| anyhow::anyhow!("Felt::new overflow: {e:?}"))
+                    })
+            })
             .collect::<std::result::Result<_, _>>()
         {
             Ok(v) => v,
@@ -1751,10 +1785,13 @@ async fn process_outbound(
         // 2) Build the bridge_out_v1 note: same script + storage Brian
         // mints on the quote side, NoteTag::with_account_target so the
         // bridge listener picks it up.
+        // v0.15: `PartialNoteMetadata` no longer carries attachments —
+        // they're attached at Note construction time. Default
+        // (empty) attachments are implicit when we go through
+        // `Note::new`.
         let tag = NoteTag::with_account_target(bridge_account);
-        let metadata = NoteMetadata::new(relay_wallet, NoteType::Public)
-            .with_tag(tag)
-            .with_attachment(NoteAttachment::default());
+        let metadata = miden_client::note::PartialNoteMetadata::new(relay_wallet, NoteType::Public)
+            .with_tag(tag);
         let mut serial_bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut serial_bytes);
         let serial_num = miden_client::Word::try_from(
@@ -2596,7 +2633,13 @@ async fn process_outbound_b2agg(
         .get_account(relay_wallet)
         .await?
         .with_context(|| format!("relay wallet {} not in store", relay_wallet.to_hex()))?;
-    let vault_balance = relay_acct.vault().get_balance(bali_faucet).unwrap_or(0);
+    // v0.15 vault.get_balance boundary conversion (see inbound).
+    let vault_balance: u64 = miden_client::asset::FungibleAsset::new(bali_faucet, 0)
+        .map(|fa| fa.vault_key())
+        .ok()
+        .and_then(|k| relay_acct.vault().get_balance(k).ok())
+        .map(u64::from)
+        .unwrap_or(0);
     info!(
         relay_wallet = %relay_wallet.to_hex(),
         bali_faucet  = %bali_faucet.to_hex(),
@@ -2805,7 +2848,13 @@ async fn process_direct_bridge_outs(
         .get_account(relay_wallet)
         .await?
         .with_context(|| format!("relay wallet {} not in store", relay_wallet.to_hex()))?;
-    let vault_balance = relay_acct.vault().get_balance(bali_faucet).unwrap_or(0);
+    // v0.15 vault.get_balance boundary conversion.
+    let vault_balance: u64 = miden_client::asset::FungibleAsset::new(bali_faucet, 0)
+        .map(|fa| fa.vault_key())
+        .ok()
+        .and_then(|k| relay_acct.vault().get_balance(k).ok())
+        .map(u64::from)
+        .unwrap_or(0);
 
     for row in pending {
         let amount: u64 = match row.amount.parse() {

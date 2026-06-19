@@ -40,7 +40,7 @@ use miden_client::asset::{Asset, FungibleAsset};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::{
-    Note, NoteAssets, NoteMetadata, NoteRecipient, NoteScript, NoteStorage, NoteType,
+    Note, NoteAssets, NoteRecipient, NoteScript, NoteStorage, NoteType,
 };
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_client_sqlite_store::SqliteStore;
@@ -202,7 +202,15 @@ async fn main() -> Result<()> {
         .get_account(sender)
         .await?
         .with_context(|| format!("sender {sender_hex} not in store; import it first"))?;
-    let sender_balance = sender_acct.vault().get_balance(deth_faucet).unwrap_or(0);
+    // v0.15: vault.get_balance takes AssetVaultKey, returns
+    // Result<AssetAmount>. Build the key via FungibleAsset and convert
+    // back to u64 at the boundary.
+    let sender_balance: u64 = miden_client::asset::FungibleAsset::new(deth_faucet, 0)
+        .map(|fa| fa.vault_key())
+        .ok()
+        .and_then(|k| sender_acct.vault().get_balance(k).ok())
+        .map(u64::from)
+        .unwrap_or(0);
     if sender_balance < amount {
         anyhow::bail!(
             "sender vault has {sender_balance} dETH from faucet {deth_faucet_hex}, \
@@ -282,7 +290,7 @@ async fn main() -> Result<()> {
         deth_faucet,
         amount,
     )?)])?;
-    let metadata = NoteMetadata::new(sender, NoteType::Public);
+    let metadata = miden_client::note::PartialNoteMetadata::new(sender, NoteType::Public);
     let recipient = NoteRecipient::new(
         serial_num,
         note_script.clone(),
