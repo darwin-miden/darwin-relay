@@ -26,18 +26,20 @@ alloy       = { version = "1", features = ["full", "providers", "sol-types", "tr
 futures     = "0.3"
 hex         = "0.4"
 
-# Miden side (optional for the demo build — gated until we wire it)
+# Miden side (optional for the demo build — gated until we wire it).
+# Bumped to the v0.15 line on 2026-06-19 alongside Devnet v0.15 going
+# live. miden-objects + miden-base stayed on 0.12 upstream.
 [dependencies.miden-client]
-version  = "0.14"
+version  = "0.15"
 features = ["tonic"]
 optional = true
 
 [dependencies.miden-client-sqlite-store]
-version  = "0.14"
+version  = "0.15"
 optional = true
 
 [dependencies.miden-protocol]
-version  = "0.14"
+version  = "0.15"
 optional = true
 
 # AggLayer B2AGG note format. Published as `miden-agglayer` on crates.io
@@ -47,7 +49,7 @@ optional = true
 # the legacy bridge_out_v1 mock format Brian's testnet bridge uses).
 [dependencies.miden-base-agglayer]
 package  = "miden-agglayer"
-version  = "=0.14.4"
+version  = "=0.15.3"
 optional = true
 
 [features]
@@ -86,15 +88,15 @@ v2-worker = [
 ]
 
 [dependencies.miden-tx]
-version  = "0.14"
+version  = "0.15"
 optional = true
 
 [dependencies.miden-assembly]
-version  = "0.22"
+version  = "0.23"
 optional = true
 
 [dependencies.miden-core-lib]
-version  = "0.22"
+version  = "0.23"
 optional = true
 
 [dependencies.miden-objects]
@@ -102,7 +104,7 @@ version  = "0.12"
 optional = true
 
 [dependencies.miden-standards]
-version  = "0.14"
+version  = "0.15"
 optional = true
 
 [dependencies.rand]
