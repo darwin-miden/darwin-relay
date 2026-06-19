@@ -1132,7 +1132,7 @@ async fn submit_atomic_deposit(
             .map(|chunk| {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(chunk);
-                miden_client::Felt::new(u64::from_le_bytes(buf))
+                miden_client::Felt::new(u64::from_le_bytes(buf) & 0xFFFF_FFFE_FFFF_FFFF).expect("masked to Goldilocks safe range")
             })
             .collect::<Vec<_>>()
             .as_slice(),
@@ -1194,9 +1194,9 @@ async fn submit_atomic_deposit(
         "atomic_deposit nav math",
     );
     let mut storage_felts = vec![
-        miden_client::Felt::new(deposit_value),
-        miden_client::Felt::new(fee_factor),
-        miden_client::Felt::new(nav_scale),
+        miden_client::Felt::new(deposit_value).expect("bounded by NAV math"),
+        miden_client::Felt::new(fee_factor).expect("bounded by NAV math"),
+        miden_client::Felt::new(nav_scale).expect("bounded by NAV math"),
     ];
     if std::env::var("DARWIN_RELAY_V2_USE_V2_NOTE")
         .map(|v| v != "0")
@@ -1218,8 +1218,8 @@ async fn submit_atomic_deposit(
         // Field-element max is p - 1 < 2^64; mask top bit to ensure
         // we never overflow Felt's canonical range.
         let mask = (1u64 << 63) - 1;
-        storage_felts.push(miden_client::Felt::new(user_id_suffix & mask));
-        storage_felts.push(miden_client::Felt::new(user_id_prefix & mask));
+        storage_felts.push(miden_client::Felt::new(user_id_suffix & mask).expect("bounded by NAV math"));
+        storage_felts.push(miden_client::Felt::new(user_id_prefix & mask).expect("bounded by NAV math"));
 
         // basket_id felts (slots 5,6 in note storage). The script writes
         // slot-10 at key (user_suffix, user_prefix, basket_suffix,
@@ -1337,7 +1337,7 @@ async fn submit_atomic_redeem(
             .map(|chunk| {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(chunk);
-                miden_client::Felt::new(u64::from_le_bytes(buf))
+                miden_client::Felt::new(u64::from_le_bytes(buf) & 0xFFFF_FFFE_FFFF_FFFF).expect("masked to Goldilocks safe range")
             })
             .collect::<Vec<_>>()
             .as_slice(),
@@ -1347,9 +1347,9 @@ async fn submit_atomic_redeem(
     //   [burn_amount, gross_release_factor, scale]
     // 9970/10000 = 99.7% net of the 30 bps redeem fee (env-tunable).
     let storage_felts = vec![
-        miden_client::Felt::new(amount),
+        miden_client::Felt::new(amount).expect("bounded by NAV math"),
         miden_client::Felt::new(tunables().redeem_fee_net_bps),
-        miden_client::Felt::new(1),
+        miden_client::Felt::new(1).expect("bounded by NAV math"),
     ];
     let recipient = NoteRecipient::new(
         serial_num,
@@ -1763,7 +1763,7 @@ async fn process_outbound(
                 .map(|chunk| {
                     let mut buf = [0u8; 8];
                     buf.copy_from_slice(chunk);
-                    miden_client::Felt::new(u64::from_le_bytes(buf))
+                    miden_client::Felt::new(u64::from_le_bytes(buf) & 0xFFFF_FFFE_FFFF_FFFF).expect("masked to Goldilocks safe range")
                 })
                 .collect::<Vec<_>>()
                 .as_slice(),

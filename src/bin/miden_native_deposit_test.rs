@@ -255,9 +255,9 @@ async fn main() -> Result<()> {
     let basket_suffix = basket_faucet.suffix();
     let basket_prefix = basket_faucet.prefix().as_felt();
     let storage_felts = vec![
-        miden_client::Felt::new(deposit_value),
-        miden_client::Felt::new(fee_factor),
-        miden_client::Felt::new(nav_scale),
+        miden_client::Felt::new(deposit_value).expect("bounded by NAV math"),
+        miden_client::Felt::new(fee_factor).expect("bounded by NAV math"),
+        miden_client::Felt::new(nav_scale).expect("bounded by NAV math"),
         user_suffix,
         user_prefix,
         basket_suffix,
@@ -272,7 +272,7 @@ async fn main() -> Result<()> {
             .map(|chunk| {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(chunk);
-                miden_client::Felt::new(u64::from_le_bytes(buf))
+                miden_client::Felt::new(u64::from_le_bytes(buf) & 0xFFFF_FFFE_FFFF_FFFF).expect("masked to Goldilocks safe range")
             })
             .collect::<Vec<_>>()
             .as_slice(),
