@@ -40,7 +40,7 @@ use miden_client::asset::{Asset, FungibleAsset};
 use miden_client::builder::ClientBuilder;
 use miden_client::keystore::FilesystemKeyStore;
 use miden_client::note::{
-    Note, NoteAssets, NoteMetadata, NoteRecipient, NoteScript, NoteStorage, NoteType,
+    Note, NoteAssets, NoteRecipient, NoteScript, NoteStorage, NoteType,
 };
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_client_sqlite_store::SqliteStore;
@@ -177,10 +177,20 @@ async fn main() -> Result<()> {
     println!("  faucet:    {deth_faucet_hex}");
     println!();
 
-    println!("Connecting to Miden testnet…");
+    let endpoint = match std::env::var("MIDEN_NETWORK")
+        .ok()
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("devnet") => miden_client::rpc::Endpoint::devnet(),
+        Some("localhost") | Some("local") => miden_client::rpc::Endpoint::localhost(),
+        _ => miden_client::rpc::Endpoint::testnet(),
+    };
+    println!("Connecting to Miden ({endpoint:?})…");
     let store = SqliteStore::new(store_path).await?;
     let mut client = ClientBuilder::<FilesystemKeyStore>::new()
-        .grpc_client(&miden_client::rpc::Endpoint::testnet(), None)
+        .grpc_client(&endpoint, None)
         .store(Arc::new(store))
         .filesystem_keystore(keystore_path)?
         .build()
@@ -202,7 +212,15 @@ async fn main() -> Result<()> {
         .get_account(sender)
         .await?
         .with_context(|| format!("sender {sender_hex} not in store; import it first"))?;
-    let sender_balance = sender_acct.vault().get_balance(deth_faucet).unwrap_or(0);
+    // v0.15: vault.get_balance takes AssetVaultKey, returns
+    // Result<AssetAmount>. Build the key via FungibleAsset and convert
+    // back to u64 at the boundary.
+    let sender_balance: u64 = miden_client::asset::FungibleAsset::new(deth_faucet, 0)
+        .map(|fa| fa.vault_key())
+        .ok()
+        .and_then(|k| sender_acct.vault().get_balance(k).ok())
+        .map(u64::from)
+        .unwrap_or(0);
     if sender_balance < amount {
         anyhow::bail!(
             "sender vault has {sender_balance} dETH from faucet {deth_faucet_hex}, \
@@ -255,9 +273,9 @@ async fn main() -> Result<()> {
     let basket_suffix = basket_faucet.suffix();
     let basket_prefix = basket_faucet.prefix().as_felt();
     let storage_felts = vec![
-        miden_client::Felt::new(deposit_value),
-        miden_client::Felt::new(fee_factor),
-        miden_client::Felt::new(nav_scale),
+        miden_client::Felt::new(deposit_value).expect("bounded by NAV math"),
+        miden_client::Felt::new(fee_factor).expect("bounded by NAV math"),
+        miden_client::Felt::new(nav_scale).expect("bounded by NAV math"),
         user_suffix,
         user_prefix,
         basket_suffix,
@@ -272,7 +290,7 @@ async fn main() -> Result<()> {
             .map(|chunk| {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(chunk);
-                miden_client::Felt::new(u64::from_le_bytes(buf))
+                miden_client::Felt::new(u64::from_le_bytes(buf) & 0xFFFF_FFFE_FFFF_FFFF).expect("masked to Goldilocks safe range")
             })
             .collect::<Vec<_>>()
             .as_slice(),
@@ -282,7 +300,7 @@ async fn main() -> Result<()> {
         deth_faucet,
         amount,
     )?)])?;
-    let metadata = NoteMetadata::new(sender, NoteType::Public);
+    let metadata = miden_client::note::PartialNoteMetadata::new(sender, NoteType::Public);
     let recipient = NoteRecipient::new(
         serial_num,
         note_script.clone(),
