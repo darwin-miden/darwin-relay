@@ -2463,6 +2463,36 @@ fn mark_intent_submitted(
             now,
         ],
     )?;
+    // Also upsert into the positions ledger the redeem endpoint reads
+    // from. The legacy 1Click path did this via the HTTP server's
+    // credit_position() when it flipped stages; the Epoch path skips
+    // those HTTP-side stages entirely so the worker has to do it here
+    // — otherwise redeem returns "no position for that user/basket"
+    // even when the on-chain slot-10 credit landed cleanly.
+    let (user, symbol): (String, String) = conn
+        .query_row(
+            "SELECT user_evm_addr, basket_symbol FROM intents WHERE correlation_id = ?1",
+            params![correlation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+    conn.execute(
+        r#"INSERT INTO positions
+              (user_evm_addr, basket_symbol, basket_amount,
+               last_correlation_id, last_updated)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(user_evm_addr, basket_symbol) DO UPDATE SET
+                basket_amount       = CAST(CAST(basket_amount AS INTEGER)
+                                          + CAST(excluded.basket_amount AS INTEGER) AS TEXT),
+                last_correlation_id = excluded.last_correlation_id,
+                last_updated        = excluded.last_updated"#,
+        params![
+            user,
+            symbol,
+            minted_basket_base.to_string(),
+            correlation_id,
+            now,
+        ],
+    )?;
     Ok(())
 }
 
