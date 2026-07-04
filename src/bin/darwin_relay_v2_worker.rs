@@ -41,6 +41,19 @@ use miden_client::note::{
 };
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_client_sqlite_store::SqliteStore;
+// v0.15 Network-account plumbing. When
+// DARWIN_RELAY_V2_NETWORK_ACCOUNT_HEX is set, the worker adds a
+// `NetworkAccountTarget` attachment on the emitted atomic_deposit_note
+// pointing at the given account (typically a v8 controller running
+// AuthNetworkAccount). Present in the tree unconditionally, but Miden
+// testnet 0.15 doesn't yet run ntx-builder for arbitrary Public network
+// accounts so the note continues to be consumed by the v7 controller
+// via the worker's own drain path. The moment ntx-builder activates
+// for our account, the network auto-consumes without us changing
+// anything else — this is the on-ramp for Solution B ("no server
+// trust") from the grant proposal.
+use miden_protocol::note::{NoteAttachment, NoteAttachments};
+use miden_standards::note::{NetworkAccountTarget, NoteExecutionHint};
 
 // Canonical Bali AggLayer note format. The B2AggNote::create call
 // returns a Note whose script_root matches what the L1 bridge
@@ -1310,7 +1323,29 @@ async fn submit_atomic_deposit(
         note_script.clone(),
         NoteStorage::new(storage_felts)?,
     );
-    let note = Note::new(assets, metadata, recipient);
+    // If a network account target is configured, wrap the note with
+    // the NetworkAccountTarget attachment so ntx-builder can pick it
+    // up whenever Miden activates arbitrary-account network execution.
+    // Otherwise fall back to a plain P2ID-style Public note (same
+    // behavior as before this env was introduced).
+    let network_target_hex =
+        std::env::var("DARWIN_RELAY_V2_NETWORK_ACCOUNT_HEX").ok();
+    let note = match network_target_hex.as_deref() {
+        Some(hex) if !hex.trim().is_empty() => {
+            let na = AccountId::from_hex(hex.trim())
+                .with_context(|| format!("network account hex parse: {hex}"))?;
+            let target = NetworkAccountTarget::new(na, NoteExecutionHint::always())
+                .map_err(|e| anyhow::anyhow!("NetworkAccountTarget::new: {e}"))?;
+            let attachments =
+                NoteAttachments::from(NoteAttachment::from(target));
+            info!(
+                network_account = %na,
+                "atomic_deposit note tagged with NetworkAccountTarget",
+            );
+            Note::with_attachments(assets, metadata, recipient, attachments)
+        }
+        _ => Note::new(assets, metadata, recipient),
+    };
     let note_id = note.id();
 
     // Step 1: relay wallet emits the note carrying the dETH.
