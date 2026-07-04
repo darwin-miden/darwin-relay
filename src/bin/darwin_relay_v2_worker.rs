@@ -70,9 +70,12 @@ const ATOMIC_DEPOSIT_NOTE_V2_MASM: &str =
 // src/components/MidenDepositPanel.tsx. Both must stay in sync.
 fn basket_faucet_hex(symbol: &str) -> Option<&'static str> {
     match symbol {
-        "DCC" => Some("0x2066f2da1f91ba202af5251d39101c"),
-        "DAG" => Some("0xfb6811fd6399df206d44f62800620d"),
-        "DCO" => Some("0xbe4efc6729eb3220423b7d6d6a0942"),
+        // v0.15 testnet — matches BASKET_TOKEN_FAUCETS_V015 in the frontend's
+        // midenConstants.ts (bumped 2026-07-04 alongside the Epoch dUSDC
+        // rewire — the old v0.14 hexes were unparseable by the v0.15 client).
+        "DCC" => Some("0x4eb76287e07e90714a86ae2b89d700"),
+        "DAG" => Some("0xed4219cb5ebf3d911c27dc6b24baa2"),
+        "DCO" => Some("0xc58107b160df13d1157b707e3f0a3d"),
         _ => None,
     }
 }
