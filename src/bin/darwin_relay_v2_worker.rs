@@ -58,6 +58,13 @@ use serde::{Deserialize, Serialize};
 const ATOMIC_DEPOSIT_NOTE_MASM: &str = include_str!("../../asm/atomic_deposit_note.masm");
 const ATOMIC_DEPOSIT_NOTE_V2_MASM: &str =
     include_str!("../../asm/atomic_deposit_note_v2.masm");
+// v3: single-call `receive_and_credit` (v0.15 MAST root 0x849f5262…).
+// v2 hardcodes v6-era digests (get_user_position 0xc9ccec54…) that the
+// deployed v7 controller no longer publishes, so its consume-leg fails
+// with "procedure with root digest not found" on testnet v0.15. v3 was
+// live-verified on Devnet 2026-06-20 against controller v7.
+const ATOMIC_DEPOSIT_NOTE_V3_MASM: &str =
+    include_str!("../../asm/atomic_deposit_note_v3.masm");
 
 // Basket token faucet IDs on Miden testnet. The atomic_deposit_note_v2
 // script writes slot-10 at the key (user_suffix, user_prefix,
@@ -390,10 +397,23 @@ async fn main() -> Result<()> {
     // controller after `receive_asset`, populating slot-10 with the
     // user's per-basket balance — so the frontend's portfolio panel
     // can read positions on-chain instead of trusting the relay db.
-    let use_v2_note = std::env::var("DARWIN_RELAY_V2_USE_V2_NOTE")
+    // Default to v3 (v0.15-native, `receive_and_credit` single-call).
+    // v2/v1 are retained behind explicit env opt-outs for post-mortem
+    // reproductions; v2 is broken against the v7 controller on v0.15.
+    let use_v3_note = std::env::var("DARWIN_RELAY_V2_USE_V3_NOTE")
         .map(|v| v != "0")
         .unwrap_or(true);
-    let deposit_program = if use_v2_note {
+    let use_v2_note = !use_v3_note
+        && std::env::var("DARWIN_RELAY_V2_USE_V2_NOTE")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+    let deposit_program = if use_v3_note {
+        TransactionKernel::assembler()
+            .with_static_library(math_lib.as_ref())
+            .map_err(|e| anyhow::anyhow!("attach math_lib (deposit_v3): {e}"))?
+            .assemble_program(ATOMIC_DEPOSIT_NOTE_V3_MASM)
+            .map_err(|e| anyhow::anyhow!("assemble atomic_deposit_note_v3.masm: {e}"))?
+    } else if use_v2_note {
         // core_lib is attached so the v2 note can `use miden::core::sys`
         // (truncate_stack) to normalise the stack after the FPI read in
         // write_user_position.
@@ -411,7 +431,7 @@ async fn main() -> Result<()> {
             .assemble_program(ATOMIC_DEPOSIT_NOTE_MASM)
             .map_err(|e| anyhow::anyhow!("assemble atomic_deposit_note.masm: {e}"))?
     };
-    info!(use_v2_note, "deposit note variant selected");
+    info!(use_v3_note, use_v2_note, "deposit note variant selected");
     let redeem_program = TransactionKernel::assembler()
         .with_static_library(math_lib.as_ref())
         .map_err(|e| anyhow::anyhow!("attach math_lib (redeem): {e}"))?
@@ -1232,20 +1252,26 @@ async fn submit_atomic_deposit(
         miden_client::Felt::new(fee_factor).expect("bounded by NAV math"),
         miden_client::Felt::new(nav_scale).expect("bounded by NAV math"),
     ];
-    if std::env::var("DARWIN_RELAY_V2_USE_V2_NOTE")
+    // v3 (default) needs storage felts 3..4 = user_id; v2 needs 3..6 =
+    // user_id + basket_id; v1 needs neither. The v3 note builds
+    // USER_BASKET_KEY = [0, 0, user_prefix, user_suffix] internally
+    // (basket half zeroed — one position per user per controller).
+    let use_v3_note = std::env::var("DARWIN_RELAY_V2_USE_V3_NOTE")
         .map(|v| v != "0")
-        .unwrap_or(true)
-    {
-        // Encode the user's EVM address into two felts: lower 16 bytes
-        // as suffix, upper 4 bytes (zero-padded) as prefix. Stable +
-        // injective for 20-byte addresses.
+        .unwrap_or(true);
+    let use_v2_note = !use_v3_note
+        && std::env::var("DARWIN_RELAY_V2_USE_V2_NOTE")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+    if use_v3_note || use_v2_note {
+        // Encode the user's EVM address into two felts: lower 8 bytes
+        // as suffix, next 8 bytes (bytes 4..12, zero-padded top) as
+        // prefix. Stable + injective for 20-byte addresses.
         let evm_bytes = hex_to_evm(&intent.user_evm_addr)
             .unwrap_or([0u8; 20]);
         let mut suffix_buf = [0u8; 8];
         let mut prefix_buf = [0u8; 8];
-        // suffix = last 8 bytes of EVM addr (LE u64)
         suffix_buf.copy_from_slice(&evm_bytes[12..20]);
-        // prefix = next 8 bytes (bytes 4..12) of EVM addr
         prefix_buf.copy_from_slice(&evm_bytes[4..12]);
         let user_id_suffix = u64::from_le_bytes(suffix_buf);
         let user_id_prefix = u64::from_le_bytes(prefix_buf);
@@ -1254,12 +1280,11 @@ async fn submit_atomic_deposit(
         let mask = (1u64 << 63) - 1;
         storage_felts.push(miden_client::Felt::new(user_id_suffix & mask).expect("bounded by NAV math"));
         storage_felts.push(miden_client::Felt::new(user_id_prefix & mask).expect("bounded by NAV math"));
-
-        // basket_id felts (slots 5,6 in note storage). The script writes
-        // slot-10 at key (user_suffix, user_prefix, basket_suffix,
-        // basket_prefix); the portfolio frontend reads with the same
-        // 4-felt key. Without these two felts the script reads them as
-        // 0/0 and the deposit lands in a slot the frontend never queries.
+    }
+    if use_v2_note {
+        // basket_id felts (slots 5,6 in v2 note storage). v3 zeroes
+        // the basket half of USER_BASKET_KEY internally so the frontend
+        // read side must match (see midenController.ts).
         let basket_hex = basket_faucet_hex(&intent.basket_symbol).with_context(|| {
             format!(
                 "unknown basket_symbol {:?} — add it to basket_faucet_hex()",

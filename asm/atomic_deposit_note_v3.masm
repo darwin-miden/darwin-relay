@@ -1,0 +1,104 @@
+# Atomic DepositNote v3 — single-call into v6's `receive_and_credit`.
+#
+# 2026-06-20 / v0.15 rewrite — replaces the drain-loop approach
+# (which buried the user_basket_key+amount_word under pad(8) and
+# made set_map_item see zeros) with a SINGLE-ASSET manual setup
+# that lands [ASSET_KEY, ASSET_VALUE, USER_BASKET_KEY, AMOUNT_WORD]
+# on the stack just before call.
+#
+# Note must carry exactly ONE asset. Storage felts (5):
+#   storage[0] = deposit_value
+#   storage[1] = fee_factor
+#   storage[2] = nav_scale
+#   storage[3] = user_id_suffix
+#   storage[4] = user_id_prefix
+#
+# v0.15 wire-format roots (v0.14 testnet roots in commented form below):
+#   receive_and_credit:
+#     v0.15: 0x849f526236e9a7ab84a183da209666c3e2839efaeb7d5866a6dca043fdaddc10
+#     v0.14: 0xeae9e249a88021a2fb6bcae39148f528ee98d5fc884290a42f961b9a536c763e
+#
+# Verified live E2E on Miden Devnet 2026-06-20 block 341421:
+#   user tx 0x… → controller v7 (0x2388eaea…) consume
+#   25 dETH credited to controller vault (200 → 300 in two test runs)
+#   slot 10 (user_positions) written with key=user_basket_key,
+#   val=AMOUNT_WORD — visible via direct storage probe.
+
+use darwin::math
+use miden::protocol::active_note
+
+@locals(2048)
+# Local memory layout:
+#   loc[0..3]   AMOUNT_WORD                 (computed at start)
+#   loc[4..7]   USER_BASKET_KEY              (built from storage)
+#   loc[8..15]  asset buffer (KEY+VALUE)    (kernel writes here)
+proc credit_single
+    # ════════════════════════════════════════════════════════
+    # PHASE 1: read storage felts to mem[100..104]
+    #   mem[100]=depval, mem[101]=fee, mem[102]=nav,
+    #   mem[103]=user_s, mem[104]=user_p
+    # ════════════════════════════════════════════════════════
+    push.100
+    exec.active_note::get_storage
+    drop
+
+    # ════════════════════════════════════════════════════════
+    # PHASE 2: compute net_amount = (depval * fee) / nav and store
+    # AMOUNT_WORD = [0, 0, 0, net_amount] in loc[0..3].
+    #
+    # felt_div([num, div]) convention: top = num, below = div, returns num/div.
+    # To get (depval * fee) / nav:
+    #   1. push nav first (it becomes the divisor — bottom of the felt_div pair)
+    #   2. push depval, then fee
+    #   3. mul → consumes top 2 (depval, fee), pushes depval*fee on top
+    #   4. felt_div → top is (depval*fee), below is nav → quotient = depval*fee/nav
+    # ════════════════════════════════════════════════════════
+    push.102 mem_load          # nav   (will be the divisor)
+    push.100 mem_load          # depval
+    push.101 mem_load          # fee
+    mul                        # depval*fee on top, nav below
+    exec.math::felt_div        # (depval*fee) / nav → net_amount
+    push.0 push.0 push.0
+    loc_storew_le.0
+    dropw
+
+    # ════════════════════════════════════════════════════════
+    # PHASE 3: build USER_BASKET_KEY = [basket_p=0, basket_s=0,
+    #          user_p, user_s] and store in loc[4..7].
+    # ════════════════════════════════════════════════════════
+    push.103 mem_load
+    push.104 mem_load
+    push.0
+    push.0
+    loc_storew_le.4
+    dropw
+
+    # ════════════════════════════════════════════════════════
+    # PHASE 4: kernel writes asset KEY+VALUE to loc[8..15].
+    # ════════════════════════════════════════════════════════
+    locaddr.8 exec.active_note::get_assets
+    drop
+
+    # ════════════════════════════════════════════════════════
+    # PHASE 5: build call frame
+    #   top 16 = [ASSET_KEY(4), ASSET_VALUE(4),
+    #             USER_BASKET_KEY(4), AMOUNT_WORD(4)]
+    # Build bottom-up: AMOUNT (deepest), USER_KEY, VAL, KEY (on top).
+    # ════════════════════════════════════════════════════════
+    padw loc_loadw_le.0
+    padw loc_loadw_le.4
+    padw loc_loadw_le.12
+    padw loc_loadw_le.8
+
+    # ════════════════════════════════════════════════════════
+    # PHASE 6: call receive_and_credit.
+    # `call` in v0.15 preserves caller depth, so we drop 16 felts
+    # after to return to base depth.
+    # ════════════════════════════════════════════════════════
+    call.0x849f526236e9a7ab84a183da209666c3e2839efaeb7d5866a6dca043fdaddc10
+    dropw dropw dropw dropw
+end
+
+begin
+    exec.credit_single
+end
