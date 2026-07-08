@@ -153,3 +153,8 @@ name              = "miden_native_deposit_test"
 path              = "src/bin/miden_native_deposit_test.rs"
 required-features = ["v2-worker"]
 
+[[bin]]
+name              = "send_network_note"
+path              = "src/bin/send_network_note.rs"
+required-features = ["v2-worker"]
+
