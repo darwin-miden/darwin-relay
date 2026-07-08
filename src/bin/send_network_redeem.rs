@@ -189,11 +189,32 @@ async fn main() -> Result<()> {
         use base64::Engine as _;
         use miden_protocol::utils::serde::Serializable;
         let b64 = base64::engine::general_purpose::STANDARD.encode(note.to_bytes());
+        // The browser also needs the (private) payback note's details to
+        // import + consume it after the NTB pays out: ship them as a
+        // serialized NoteFile::NoteDetails for the SDK's importNoteFile.
+        let payback_assets = NoteAssets::new(vec![release_asset])?;
+        let payback_metadata = PartialNoteMetadata::new(target, NoteType::Private)
+            .with_tag(payback_tag);
+        let payback_note = Note::new(
+            payback_assets,
+            payback_metadata,
+            P2idNoteStorage::new(recipient).into_recipient(payback_serial),
+        );
+        let payback_id = payback_note.id();
+        let payback_file = miden_protocol::note::NoteFile::NoteDetails {
+            details: payback_note.into(),
+            after_block_num: 0u32.into(),
+            tag: Some(payback_tag),
+        };
+        let payback_b64 =
+            base64::engine::general_purpose::STANDARD.encode(payback_file.to_bytes());
         println!(
             "{}",
             serde_json::json!({
                 "noteId": note_id.to_string(),
                 "noteB64": b64,
+                "paybackId": payback_id.to_string(),
+                "paybackFileB64": payback_b64,
                 "paybackTag": payback_tag.as_u32(),
             })
         );
