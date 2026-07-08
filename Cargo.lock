@@ -1851,6 +1851,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "futures",
  "hex",
  "miden-agglayer",

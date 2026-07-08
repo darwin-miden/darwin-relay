@@ -99,6 +99,8 @@ async fn main() -> Result<()> {
     let mut basket = "DCC".to_string();
     let mut amount: u64 = 100_000;
     let mut print_root = false;
+    let mut no_attachment = false;
+    let mut emit_json = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -109,6 +111,8 @@ async fn main() -> Result<()> {
             "--basket" => basket = args.next().context("--basket value")?,
             "--amount" => amount = args.next().context("--amount value")?.parse()?,
             "--print-root" => print_root = true,
+            "--no-attachment" => no_attachment = true,
+            "--emit-json" => emit_json = true,
             _ => {}
         }
     }
@@ -129,25 +133,6 @@ async fn main() -> Result<()> {
         .1;
     let basket_faucet = AccountId::from_hex(basket_hex)?;
     let (user_suffix, user_prefix) = evm_to_user_felts(&user_evm)?;
-
-    let home = std::env::var("HOME")?;
-    let store_path = std::env::var("DARWIN_RELAY_V2_MIDEN_STORE").unwrap_or_else(|_| {
-        format!("{home}/data/darwin/.relay-miden-testnet/.miden/store.sqlite3")
-    });
-    let keystore_path = std::env::var("DARWIN_RELAY_V2_MIDEN_KEYSTORE").unwrap_or_else(|_| {
-        format!("{home}/data/darwin/.relay-miden-testnet/.miden/keystore")
-    });
-
-    println!("Connecting miden-client (testnet)…");
-    let store = SqliteStore::new(PathBuf::from(&store_path)).await?;
-    let endpoint = miden_client::rpc::Endpoint::testnet();
-    let mut client = ClientBuilder::<FilesystemKeyStore>::new()
-        .grpc_client(&endpoint, None)
-        .store(Arc::new(store))
-        .filesystem_keystore(PathBuf::from(&keystore_path))?
-        .build()
-        .await?;
-    client.sync_state().await?;
 
     // fee_factor = nav_scale = 1 → mint_amount = deposit_value: the
     // position accumulates raw dUSDC base units, mirroring the
@@ -178,15 +163,61 @@ async fn main() -> Result<()> {
     )?;
 
     let assets = NoteAssets::new(vec![Asset::Fungible(FungibleAsset::new(faucet, amount)?)])?;
-    let na_target = NetworkAccountTarget::new(target, NoteExecutionHint::Always)
-        .map_err(|e| anyhow::anyhow!("NetworkAccountTarget: {e:?}"))?;
-    let attachments = NoteAttachments::new(vec![NoteAttachment::from(na_target)])
-        .map_err(|e| anyhow::anyhow!("NoteAttachments: {e:?}"))?;
+    // --no-attachment probes whether the NTB routes by tag alone —
+    // the web SDK's plain Note constructor can't carry attachments, so
+    // the browser rail depends on the answer.
+    let attachments = if no_attachment {
+        NoteAttachments::empty()
+    } else {
+        let na_target = NetworkAccountTarget::new(target, NoteExecutionHint::Always)
+            .map_err(|e| anyhow::anyhow!("NetworkAccountTarget: {e:?}"))?;
+        NoteAttachments::new(vec![NoteAttachment::from(na_target)])
+            .map_err(|e| anyhow::anyhow!("NoteAttachments: {e:?}"))?
+    };
     let metadata = PartialNoteMetadata::new(sender, NoteType::Public)
         .with_tag(NoteTag::with_account_target(target));
     let recipient = NoteRecipient::new(serial_num, note_script, NoteStorage::new(storage_felts)?);
     let note = Note::with_attachments(assets, metadata, recipient, attachments);
     let note_id = note.id();
+
+    if emit_json {
+        // Browser-emit mode: print the serialized note for the web SDK's
+        // Note.deserialize. The browser signs + proves the emitting tx
+        // from the user's derived wallet — this binary never touches a
+        // key or the network in this mode.
+        use miden_protocol::utils::serde::Serializable;
+        let bytes = note.to_bytes();
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        println!(
+            "{}",
+            serde_json::json!({
+                "noteId": note_id.to_string(),
+                "noteB64": b64,
+                "scriptRoot": note.script().root().to_string(),
+            })
+        );
+        return Ok(());
+    }
+
+    let home = std::env::var("HOME")?;
+    let store_path = std::env::var("DARWIN_RELAY_V2_MIDEN_STORE").unwrap_or_else(|_| {
+        format!("{home}/data/darwin/.relay-miden-testnet/.miden/store.sqlite3")
+    });
+    let keystore_path = std::env::var("DARWIN_RELAY_V2_MIDEN_KEYSTORE").unwrap_or_else(|_| {
+        format!("{home}/data/darwin/.relay-miden-testnet/.miden/keystore")
+    });
+
+    println!("Connecting miden-client (testnet)…");
+    let store = SqliteStore::new(PathBuf::from(&store_path)).await?;
+    let endpoint = miden_client::rpc::Endpoint::testnet();
+    let mut client = ClientBuilder::<FilesystemKeyStore>::new()
+        .grpc_client(&endpoint, None)
+        .store(Arc::new(store))
+        .filesystem_keystore(PathBuf::from(&keystore_path))?
+        .build()
+        .await?;
+    client.sync_state().await?;
 
     println!("Emitting network atomic deposit note…");
     println!("    target : {} (network controller)", target.to_hex());
