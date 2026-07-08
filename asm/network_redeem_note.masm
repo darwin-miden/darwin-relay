@@ -1,0 +1,80 @@
+# Network redeem request note — executed BY THE NETWORK (NTX builder)
+# against the v9.3 network controller.
+#
+# The note carries NO assets; it is a request. Under network execution:
+#
+#   1. Debit the (user, basket) slot-10 position by `amount`, clamped
+#      at 0 (read-modify-write, same key order as the deposit note).
+#   2. Create a payback P2ID note carrying `amount` dUSDC out of the
+#      CONTROLLER's vault to the user's wallet — swap-note pattern:
+#      output_note::create + basic wallet move_asset_to_note (the
+#      controller includes the BasicWallet component in v9.3).
+#
+# Storage felts (loaded at ptr 100, deposit-note convention):
+#   100..103 = ASSET KEY word   (dUSDC vault key)
+#   104..107 = ASSET VALUE word (amount-bearing word)
+#   108..111 = PAYBACK_RECIPIENT digest word (P2ID → user wallet)
+#   112      = payback note_type felt (Public)
+#   113      = payback note tag felt (with_account_target(user wallet))
+#   114      = amount (position debit, dUSDC base units)
+#   115      = user_id_suffix
+#   116      = user_id_prefix
+#   117      = basket_id_suffix
+#   118      = basket_id_prefix
+#
+# Controller MAST roots (v0.15 rotation):
+#   get_user_position   0x47b239ea11ad0375cca5a082369f721729c6d63a1fb170e6b5be5755dd06301f
+#   set_user_position   0xea652ac9aa1b6ee468da0845b52008ffa4639d112f356534ba608bc00d7b6f5f
+
+use miden::core::sys
+use miden::protocol::active_note
+use miden::protocol::output_note
+use miden::standards::wallets::basic
+
+begin
+    push.100
+    exec.active_note::get_storage
+    drop drop
+
+    # --- debit the (user, basket) slot-10 position, clamped at 0 ---
+    push.115 mem_load                  # user_id_suffix
+    push.116 mem_load                  # user_id_prefix
+    push.117 mem_load                  # basket_id_suffix
+    push.118 mem_load                  # basket_id_prefix
+    call.0x47b239ea11ad0375cca5a082369f721729c6d63a1fb170e6b5be5755dd06301f
+    exec.sys::truncate_stack
+    add add add                        # [cur]
+    push.114 mem_load                  # [amount, cur]
+    dup.1 dup.1                        # [amount, cur, amount, cur]
+    gte                                # [cur >= amount, amount, cur]
+    if.true
+        sub                            # [cur - amount]
+    else
+        drop drop push.0               # overdraw -> clamp to zero
+    end
+    # [new_pos]
+    push.115 mem_load
+    push.116 mem_load
+    push.117 mem_load
+    push.118 mem_load
+    # Stack: [basket_prefix, basket_suffix, user_prefix, user_suffix, new_pos]
+    movup.4                            # [new_pos, key(4)]
+    push.0 push.0 push.0               # [0, 0, 0, new_pos, key(4)]
+    swapw                              # [key(4), value(4)]
+    call.0xea652ac9aa1b6ee468da0845b52008ffa4639d112f356534ba608bc00d7b6f5f
+    dropw
+    exec.sys::truncate_stack
+
+    # --- create the payback P2ID + move the dUSDC out of the vault ---
+    padw push.108 mem_loadw_le         # [PAYBACK_RECIPIENT]
+    push.112 mem_load                  # [note_type, RECIPIENT]
+    push.113 mem_load                  # [tag, note_type, RECIPIENT]
+    exec.output_note::create           # [note_idx]
+
+    padw push.0.0.0 movup.7            # [note_idx, pad(7)]
+    padw push.104 mem_loadw_le         # [ASSET_VALUE, note_idx, pad(7)]
+    padw push.100 mem_loadw_le         # [ASSET_KEY, ASSET_VALUE, note_idx, pad(7)]
+    call.basic::move_asset_to_note
+    dropw dropw
+    exec.sys::truncate_stack
+end

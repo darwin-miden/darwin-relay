@@ -164,3 +164,8 @@ name              = "send_network_deposit"
 path              = "src/bin/send_network_deposit.rs"
 required-features = ["v2-worker"]
 
+[[bin]]
+name              = "send_network_redeem"
+path              = "src/bin/send_network_redeem.rs"
+required-features = ["v2-worker"]
+
