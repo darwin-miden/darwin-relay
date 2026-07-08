@@ -44,8 +44,8 @@ use miden::protocol::asset::ASSET_SIZE
 @locals(2048)
 proc drain_assets_into_controller
     locaddr.0 exec.active_note::get_assets
-    mul.ASSET_SIZE dup.1 add
-    padw padw movup.9
+    # v0.15 fix: get_assets consumes the ptr; re-emit base then build end_ptr.
+    mul.ASSET_SIZE locaddr.0 dup movdn.2 add    padw padw movup.9
     dup dup.10 neq
     while.true
         dup movdn.9
