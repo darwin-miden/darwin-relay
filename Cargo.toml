@@ -158,3 +158,8 @@ name              = "send_network_note"
 path              = "src/bin/send_network_note.rs"
 required-features = ["v2-worker"]
 
+[[bin]]
+name              = "send_network_deposit"
+path              = "src/bin/send_network_deposit.rs"
+required-features = ["v2-worker"]
+
