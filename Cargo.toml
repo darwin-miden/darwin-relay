@@ -169,3 +169,8 @@ name              = "send_network_redeem"
 path              = "src/bin/send_network_redeem.rs"
 required-features = ["v2-worker"]
 
+[[bin]]
+name              = "send_mint_request"
+path              = "src/bin/send_mint_request.rs"
+required-features = ["v2-worker"]
+
