@@ -1,0 +1,44 @@
+# v10 confidential redeem note — executed BY THE NETWORK against the
+# basket faucet-network account.
+#
+# The note carries the depositor's basket tokens. In one network tx:
+#   1. receive_and_burn → burn the basket tokens (reduces supply).
+#   2. release the pro-rata dUSDC from the faucet vault into a PRIVATE
+#      P2ID note for the redeemer (swap-note pattern:
+#      output_note::create + BasicWallet::move_asset_to_note).
+#
+# Storage felts (loaded at ptr 100). Word loads must be 4-aligned, so
+# the asset words sit at 108/112 with 106..107 padding:
+#   100..103 = RECIPIENT digest  (P2ID private → redeemer wallet)
+#   104      = note_type         (Private = 0)
+#   105      = tag
+#   106..107 = padding
+#   108..111 = dUSDC ASSET_KEY   (collateral to release)
+#   112..115 = dUSDC ASSET_VALUE (amount word)
+
+use miden::core::sys
+use miden::protocol::active_note
+use miden::protocol::output_note
+use miden::standards::wallets::basic
+use miden::standards::faucets::fungible
+
+begin
+    push.100 exec.active_note::get_storage
+    drop drop
+
+    # 1. burn the basket tokens the note carries
+    call.fungible::receive_and_burn
+
+    # 2. create the private payback + move dUSDC out of the vault
+    padw push.100 mem_loadw_le         # [RECIPIENT]
+    push.104 mem_load                  # [note_type, RECIPIENT]
+    push.105 mem_load                  # [tag, note_type, RECIPIENT]
+    exec.output_note::create           # [note_idx]
+
+    padw push.0.0.0 movup.7            # [note_idx, pad(7)]
+    padw push.112 mem_loadw_le         # [ASSET_VALUE, note_idx, pad(7)]
+    padw push.108 mem_loadw_le         # [ASSET_KEY, ASSET_VALUE, note_idx, pad(7)]
+    call.basic::move_asset_to_note
+    dropw dropw
+    exec.sys::truncate_stack
+end
