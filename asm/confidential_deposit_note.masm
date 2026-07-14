@@ -1,0 +1,83 @@
+# v10 confidential deposit note — executed BY THE NETWORK against the
+# basket faucet-network account.
+#
+# One network transaction does the full confidential deposit:
+#   1. Drain the note's dUSDC collateral into the faucet's vault
+#      (BasicWallet::receive_asset) — this is the fund's public AUM.
+#   2. mint_amount = deposit_value * fee_factor / nav_scale
+#      (spike: fee_factor = nav_scale = 1 ⇒ 1:1; Pragma NAV wires in here).
+#   3. Build the basket-token asset for THIS faucet
+#      (asset::create_fungible_asset with the active account id).
+#   4. mint_and_send → a PRIVATE P2ID note carrying the freshly-minted
+#      basket tokens to the depositor's wallet. Who-holds-what stays
+#      confidential; only the vault + supply are public.
+#
+# Storage felts (loaded at ptr 100):
+#   100..103 = RECIPIENT digest  (P2ID private → depositor wallet)
+#   104      = note_type         (Private = 0)
+#   105      = tag               (with_account_target(depositor))
+#   106      = deposit_value     (dUSDC base units, for the mint math)
+#   107      = fee_factor
+#   108      = nav_scale
+
+use miden::core::sys
+use miden::protocol::active_note
+use miden::protocol::active_account
+use miden::protocol::asset
+use miden::protocol::asset::ASSET_VALUE_MEMORY_OFFSET
+use miden::protocol::asset::ASSET_SIZE
+use darwin::math
+use miden::standards::wallets::basic
+use miden::standards::faucets::fungible
+
+@locals(2048)
+proc drain_collateral_into_faucet
+    locaddr.0 exec.active_note::get_assets
+    # v0.15 fix: get_assets consumes the ptr; re-emit base then end_ptr.
+    mul.ASSET_SIZE locaddr.0 dup movdn.2 add    padw padw movup.9
+    dup dup.10 neq
+    while.true
+        dup movdn.9
+        add.ASSET_VALUE_MEMORY_OFFSET mem_loadw_le swapw
+        dup.8 mem_loadw_le
+        padw padw swapdw
+        call.basic::receive_asset
+        dropw dropw
+        movup.8 add.ASSET_SIZE dup
+        dup.10 neq
+    end
+    drop dropw dropw drop
+end
+
+begin
+    push.100 exec.active_note::get_storage
+    drop drop
+
+    # 1. drain the dUSDC collateral into the faucet vault
+    exec.drain_collateral_into_faucet
+
+    # 2. mint_amount = deposit_value * fee_factor / nav_scale
+    push.106 mem_load                  # deposit_value
+    push.107 mem_load                  # fee_factor
+    mul
+    push.108 mem_load                  # nav_scale
+    swap
+    exec.math::felt_div                # [mint_amount]
+
+    # 3. build the basket-token asset for the active faucet
+    exec.active_account::get_id        # [suffix, prefix, mint_amount]
+    push.0                             # [enable_callbacks=0, suffix, prefix, mint_amount]
+    exec.asset::create_fungible_asset  # [ASSET_KEY, ASSET_VALUE]
+    mem_storew_le.200 dropw            # ASSET_KEY   → 200
+    mem_storew_le.204 dropw            # ASSET_VALUE → 204
+
+    # 4. mint_and_send: [ASSET_KEY, ASSET_VALUE, tag, note_type, RECIPIENT, pad(2)]
+    padw push.100 mem_loadw_le         # [RECIPIENT]
+    push.104 mem_load                  # [note_type, RECIPIENT]
+    push.105 mem_load                  # [tag, note_type, RECIPIENT]
+    padw push.204 mem_loadw_le         # [ASSET_VALUE, tag, note_type, RECIPIENT]
+    padw push.200 mem_loadw_le         # [ASSET_KEY, ASSET_VALUE, tag, note_type, RECIPIENT]
+    call.fungible::mint_and_send
+
+    exec.sys::truncate_stack
+end
