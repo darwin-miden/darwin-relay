@@ -88,7 +88,10 @@ async fn main() -> Result<()> {
     let mut recipient: Option<String> = None;
     let mut collateral_faucet = DEFAULT_DUSDC.to_string();
     let mut amount: u64 = 500_000;
+    let mut fee_factor: u64 = 1;
+    let mut nav_scale: u64 = 1;
     let mut print_root = false;
+    let mut emit_json = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -97,7 +100,10 @@ async fn main() -> Result<()> {
             "--recipient" => recipient = Some(args.next().context("--recipient value")?),
             "--collateral" => collateral_faucet = args.next().context("--collateral value")?,
             "--amount" => amount = args.next().context("--amount value")?.parse()?,
+            "--fee-factor" => fee_factor = args.next().context("--fee-factor value")?.parse()?,
+            "--nav-scale" => nav_scale = args.next().context("--nav-scale value")?.parse()?,
             "--print-root" => print_root = true,
+            "--emit-json" => emit_json = true,
             _ => {}
         }
     }
@@ -125,8 +131,8 @@ async fn main() -> Result<()> {
     storage_felts.push(NoteType::Private.into()); // 104
     storage_felts.push(payback_tag.into()); // 105
     storage_felts.push(miden_client::Felt::new(amount).expect("amount")); // 106
-    storage_felts.push(miden_client::Felt::new(1).expect("1")); // 107 fee_factor
-    storage_felts.push(miden_client::Felt::new(1).expect("1")); // 108 nav_scale
+    storage_felts.push(miden_client::Felt::new(fee_factor).expect("fee")); // 107
+    storage_felts.push(miden_client::Felt::new(nav_scale).expect("nav")); // 108
 
     // The note carries the dUSDC collateral.
     let assets = NoteAssets::new(vec![Asset::Fungible(FungibleAsset::new(
@@ -143,6 +149,41 @@ async fn main() -> Result<()> {
         NoteRecipient::new(rand_word()?, note_script, NoteStorage::new(storage_felts)?);
     let note = Note::with_attachments(assets, metadata, note_recipient, attachments);
     let note_id = note.id();
+
+    // Tokens the network will mint: deposit_value * fee_factor / nav_scale.
+    let mint_amount = amount.saturating_mul(fee_factor) / nav_scale.max(1);
+
+    if emit_json {
+        use base64::Engine as _;
+        use miden_protocol::utils::serde::Serializable;
+        let note_b64 = base64::engine::general_purpose::STANDARD.encode(note.to_bytes());
+        // Private payback (the minted basket-token note) as a NoteFile for
+        // the browser to import + consume, same as the redeem builder.
+        let mint_asset = FungibleAsset::new(faucet, mint_amount)?;
+        let payback_note = Note::new(
+            NoteAssets::new(vec![Asset::Fungible(mint_asset)])?,
+            PartialNoteMetadata::new(faucet, NoteType::Private).with_tag(payback_tag),
+            P2idNoteStorage::new(recipient).into_recipient(payback_serial),
+        );
+        let payback_file = miden_protocol::note::NoteFile::NoteDetails {
+            details: payback_note.clone().into(),
+            after_block_num: 0u32.into(),
+            tag: Some(payback_tag),
+        };
+        let payback_b64 =
+            base64::engine::general_purpose::STANDARD.encode(payback_file.to_bytes());
+        println!(
+            "{}",
+            serde_json::json!({
+                "noteId": note_id.to_string(),
+                "noteB64": note_b64,
+                "paybackId": payback_note.id().to_string(),
+                "paybackFileB64": payback_b64,
+                "mintAmount": mint_amount.to_string(),
+            })
+        );
+        return Ok(());
+    }
 
     let home = std::env::var("HOME")?;
     let store_path = std::env::var("DARWIN_RELAY_V2_MIDEN_STORE").unwrap_or_else(|_| {
@@ -162,7 +203,7 @@ async fn main() -> Result<()> {
 
     println!("Emitting confidential deposit at network faucet…");
     println!("    faucet    : {}", faucet.to_hex());
-    println!("    collateral: {amount} dUSDC → mint {amount} basket tokens (1:1 spike)");
+    println!("    collateral: {amount} dUSDC → mint {mint_amount} basket tokens (fee={fee_factor} nav={nav_scale})");
     println!("    recipient : {} (private)", recipient.to_hex());
     println!("    note id   : {note_id}");
 
@@ -176,7 +217,7 @@ async fn main() -> Result<()> {
     println!("    emit tx   : {tx_id} (height {height})");
 
     // Reconstruct + consume the private minted note.
-    let mint_asset = FungibleAsset::new(faucet, amount)?;
+    let mint_asset = FungibleAsset::new(faucet, mint_amount)?;
     let payback_note = Note::new(
         NoteAssets::new(vec![Asset::Fungible(mint_asset)])?,
         PartialNoteMetadata::new(faucet, NoteType::Private).with_tag(payback_tag),
@@ -209,7 +250,7 @@ async fn main() -> Result<()> {
                 let cproven = client.prove_transaction_with(&cres, prover.clone()).await?;
                 let cheight = client.submit_proven_transaction(cproven, &cres).await?;
                 client.apply_transaction(&cres, cheight).await?;
-                println!("    ✓ {amount} basket tokens minted into {} — consume tx {ctx}", recipient.to_hex());
+                println!("    ✓ {mint_amount} basket tokens minted into {} — consume tx {ctx}", recipient.to_hex());
                 println!();
                 println!("CONFIDENTIAL DEPOSIT (FULL) PROVEN: dUSDC collateral drained");
                 println!("into the faucet vault AND basket tokens minted to a private");
