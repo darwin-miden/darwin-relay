@@ -191,8 +191,21 @@ async fn main() -> Result<()> {
     println!("Waiting for the network to burn tokens + release the private dUSDC note…");
     for i in 0..25 {
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-        client.sync_state().await?;
-        if let Some(rec) = client.get_input_note(payback_id).await? {
+        // Testnet occasionally returns a transient sync race
+        // ("block_to > chain tip") — don't abort the whole redeem on it,
+        // just skip this tick and retry on the next.
+        if let Err(e) = client.sync_state().await {
+            println!("    (sync retry: {})", e.to_string().lines().next().unwrap_or(""));
+            continue;
+        }
+        let maybe = match client.get_input_note(payback_id).await {
+            Ok(m) => m,
+            Err(e) => {
+                println!("    (get_note retry: {})", e.to_string().lines().next().unwrap_or(""));
+                continue;
+            }
+        };
+        if let Some(rec) = maybe {
             if rec.is_committed() {
                 println!("    released after ~{}s — consuming…", (i + 1) * 6);
                 let creq = TransactionRequestBuilder::new()

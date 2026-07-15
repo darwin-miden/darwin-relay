@@ -2,23 +2,28 @@
 # basket faucet-network account.
 #
 # One network transaction does the full confidential deposit:
-#   1. Drain the note's dUSDC collateral into the faucet's vault
-#      (BasicWallet::receive_asset) — this is the fund's public AUM.
-#   2. mint_amount = deposit_value * fee_factor / nav_scale
-#      (spike: fee_factor = nav_scale = 1 ⇒ 1:1; Pragma NAV wires in here).
-#   3. Build the basket-token asset for THIS faucet
-#      (asset::create_fungible_asset with the active account id).
-#   4. mint_and_send → a PRIVATE P2ID note carrying the freshly-minted
-#      basket tokens to the depositor's wallet. Who-holds-what stays
-#      confidential; only the vault + supply are public.
+#   1. Read + REQUIRE exactly one collateral asset; its REAL amount is
+#      the mint basis. SECURITY: the mint is bound to the collateral the
+#      note actually carries, NOT to an emitter-controlled storage felt.
+#      To mint X basket tokens the note must be funded with X*nav_scale
+#      worth of dUSDC, which the emitter must own to emit the note — so a
+#      note with zero/underfunded collateral can no longer mint from thin
+#      air. (Was: mint_amount = storage[106]; storage is set by the
+#      emitter and independent of the drained NoteAssets.)
+#   2. Drain that collateral into the faucet's vault (public AUM).
+#   3. mint_amount = collateral_amount * fee_factor / nav_scale.
+#   4. mint_and_send → a PRIVATE P2ID note to the depositor's wallet.
 #
 # Storage felts (loaded at ptr 100):
 #   100..103 = RECIPIENT digest  (P2ID private → depositor wallet)
 #   104      = note_type         (Private = 0)
 #   105      = tag               (with_account_target(depositor))
-#   106      = deposit_value     (dUSDC base units, for the mint math)
+#   106      = deposit_value     (ADVISORY only — no longer trusted for the mint)
 #   107      = fee_factor
 #   108      = nav_scale
+#
+# NOTE: changing this script changes its root; the basket faucet's
+# AuthNetworkAccount allowlist must be redeployed with the new root.
 
 use miden::core::sys
 use miden::protocol::active_note
@@ -29,6 +34,18 @@ use miden::protocol::asset::ASSET_SIZE
 use darwin::math
 use miden::standards::wallets::basic
 use miden::standards::faucets::fungible
+
+# Read the note's single collateral asset amount (the REAL mint basis)
+# and stash it at abs mem[210]. Asserts exactly one asset so a
+# multi-asset note can't smuggle in a second, unpriced asset.
+@locals(64)
+proc read_collateral_amount
+    locaddr.0 exec.active_note::get_assets      # [num_assets]
+    push.1 assert_eq.err="confidential deposit note must carry exactly one collateral asset"
+    padw locaddr.0 add.ASSET_VALUE_MEMORY_OFFSET mem_loadw_le  # [ASSET_VALUE]
+    exec.asset::fungible_value_into_amount       # [collateral_amount]
+    mem_store.210
+end
 
 @locals(2048)
 proc drain_collateral_into_faucet
@@ -53,25 +70,28 @@ begin
     push.100 exec.active_note::get_storage
     drop drop
 
-    # 1. drain the dUSDC collateral into the faucet vault
+    # 1. read the REAL collateral amount (the trusted mint basis)
+    exec.read_collateral_amount
+
+    # 2. drain the dUSDC collateral into the faucet vault
     exec.drain_collateral_into_faucet
 
-    # 2. mint_amount = deposit_value * fee_factor / nav_scale
-    push.106 mem_load                  # deposit_value
+    # 3. mint_amount = collateral_amount * fee_factor / nav_scale
+    mem_load.210                       # collateral_amount (drained, trusted)
     push.107 mem_load                  # fee_factor
     mul
     push.108 mem_load                  # nav_scale
     swap
     exec.math::felt_div                # [mint_amount]
 
-    # 3. build the basket-token asset for the active faucet
+    # 4. build the basket-token asset for the active faucet
     exec.active_account::get_id        # [suffix, prefix, mint_amount]
     push.0                             # [enable_callbacks=0, suffix, prefix, mint_amount]
     exec.asset::create_fungible_asset  # [ASSET_KEY, ASSET_VALUE]
     mem_storew_le.200 dropw            # ASSET_KEY   → 200
     mem_storew_le.204 dropw            # ASSET_VALUE → 204
 
-    # 4. mint_and_send: [ASSET_KEY, ASSET_VALUE, tag, note_type, RECIPIENT, pad(2)]
+    # 5. mint_and_send: [ASSET_KEY, ASSET_VALUE, tag, note_type, RECIPIENT, pad(2)]
     padw push.100 mem_loadw_le         # [RECIPIENT]
     push.104 mem_load                  # [note_type, RECIPIENT]
     push.105 mem_load                  # [tag, note_type, RECIPIENT]

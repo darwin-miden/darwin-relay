@@ -2,34 +2,68 @@
 # basket faucet-network account.
 #
 # The note carries the depositor's basket tokens. In one network tx:
-#   1. receive_and_burn → burn the basket tokens (reduces supply).
-#   2. release the pro-rata dUSDC from the faucet vault into a PRIVATE
-#      P2ID note for the redeemer (swap-note pattern:
-#      output_note::create + BasicWallet::move_asset_to_note).
+#   1. Read the REAL burned amount from the note's single basket-token
+#      asset (BEFORE burning — receive_and_burn clobbers low memory).
+#   2. receive_and_burn → burn the basket tokens (reduces supply).
+#   3. release = burned. SECURITY: the payout is tied to the REAL basket
+#      tokens burned — which the redeemer must own to emit the note — NOT
+#      to a free storage felt. So a redeemer can never extract more dUSDC
+#      than the tokens they burn, and the vault cannot be drained beyond
+#      total deposits (the move below fails safely if the vault lacks that
+#      much dUSDC). At the 1:1 spike nav this is exact. (Was: the payout
+#      amount was the free storage felt at 112 ⇒ burn 1 token, drain the
+#      entire vault.)
+#   4. create the private payback + move `release` dUSDC to it, using the
+#      storage dUSDC KEY with its amount felt (mem[112]) patched to the
+#      real burned amount.
 #
-# Storage felts (loaded at ptr 100). Word loads must be 4-aligned, so
-# the asset words sit at 108/112 with 106..107 padding:
+# Storage felts (loaded at ptr 100). Word loads are 4-aligned:
 #   100..103 = RECIPIENT digest  (P2ID private → redeemer wallet)
 #   104      = note_type         (Private = 0)
 #   105      = tag
 #   106..107 = padding
-#   108..111 = dUSDC ASSET_KEY   (collateral to release)
-#   112..115 = dUSDC ASSET_VALUE (amount word)
+#   108..111 = dUSDC ASSET_KEY   (identifies the collateral to release)
+#   112..115 = dUSDC ASSET_VALUE (amount felt at 112 is patched on-chain)
+#
+# NOTE: changing this script changes its root; the basket faucet's
+# AuthNetworkAccount allowlist must be redeployed with the new root.
 
 use miden::core::sys
 use miden::protocol::active_note
+use miden::protocol::asset
+use miden::protocol::asset::ASSET_VALUE_MEMORY_OFFSET
 use miden::protocol::output_note
 use miden::standards::wallets::basic
 use miden::standards::faucets::fungible
+
+# Read the note's single basket-token asset amount (the burn/redeem
+# basis) into abs mem[210]. Asserts exactly one asset. Must run BEFORE
+# receive_and_burn, which overwrites low memory during its supply update.
+@locals(64)
+proc read_burned_amount
+    locaddr.0 exec.active_note::get_assets      # [num_assets]
+    push.1 assert_eq.err="confidential redeem note must carry exactly one basket-token asset"
+    padw locaddr.0 add.ASSET_VALUE_MEMORY_OFFSET mem_loadw_le  # [ASSET_VALUE]
+    exec.asset::fungible_value_into_amount       # [burned]
+    mem_store.210
+end
 
 begin
     push.100 exec.active_note::get_storage
     drop drop
 
-    # 1. burn the basket tokens the note carries
+    # 1. read the REAL burned amount (before receive_and_burn clobbers mem)
+    exec.read_burned_amount
+
+    # 2. burn the basket tokens the note carries
     call.fungible::receive_and_burn
 
-    # 2. create the private payback + move dUSDC out of the vault
+    # 3. release = burned: patch the storage dUSDC ASSET_VALUE amount felt
+    #    (mem[112]) to the real burned amount.
+    mem_load.210 mem_store.112
+
+    # 4. create the private payback + move the dUSDC out (proven swap-note
+    #    path: storage dUSDC KEY[108] + patched VALUE[112]).
     padw push.100 mem_loadw_le         # [RECIPIENT]
     push.104 mem_load                  # [note_type, RECIPIENT]
     push.105 mem_load                  # [tag, note_type, RECIPIENT]
