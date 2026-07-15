@@ -30,6 +30,7 @@
 
 use miden::core::sys
 use miden::protocol::active_note
+use miden::protocol::active_account
 use miden::protocol::asset
 use miden::protocol::asset::ASSET_VALUE_MEMORY_OFFSET
 use miden::protocol::output_note
@@ -37,12 +38,23 @@ use miden::standards::wallets::basic
 use miden::standards::faucets::fungible
 
 # Read the note's single basket-token asset amount (the burn/redeem
-# basis) into abs mem[210]. Asserts exactly one asset. Must run BEFORE
-# receive_and_burn, which overwrites low memory during its supply update.
+# basis) into abs mem[210]. Asserts exactly one asset AND that it is THIS
+# basket faucet's own token. Must run BEFORE receive_and_burn, which
+# overwrites low memory during its supply update.
 @locals(64)
 proc read_burned_amount
     locaddr.0 exec.active_note::get_assets      # [num_assets]
     push.1 assert_eq.err="confidential redeem note must carry exactly one basket-token asset"
+
+    # defense in depth: the burned asset MUST be THIS basket faucet's own
+    # token. faucet::burn already enforces this in-kernel, but assert it
+    # early so a future refactor can't slip a foreign asset through.
+    padw locaddr.0 mem_loadw_le                  # [ASSET_KEY]
+    exec.asset::key_into_faucet_id               # [a_suffix, a_prefix]
+    exec.active_account::get_id                  # [act_suffix, act_prefix, a_suffix, a_prefix]
+    movup.2 assert_eq.err="redeem must burn this basket's own token"
+    assert_eq.err="redeem must burn this basket's own token"
+
     padw locaddr.0 add.ASSET_VALUE_MEMORY_OFFSET mem_loadw_le  # [ASSET_VALUE]
     exec.asset::fungible_value_into_amount       # [burned]
     mem_store.210
