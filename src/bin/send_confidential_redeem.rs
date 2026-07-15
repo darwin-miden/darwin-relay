@@ -189,7 +189,7 @@ async fn main() -> Result<()> {
 
     println!();
     println!("Waiting for the network to burn tokens + release the private dUSDC note…");
-    for i in 0..25 {
+    for i in 0..40 {
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
         // Testnet occasionally returns a transient sync race
         // ("block_to > chain tip") — don't abort the whole redeem on it,
@@ -224,6 +224,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-    println!("    not released after 150s — check network-note-status {note_id}");
+    println!("    not released after ~240s — check network-note-status {note_id}");
     Ok(())
 }

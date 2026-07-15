@@ -236,10 +236,23 @@ async fn main() -> Result<()> {
 
     println!();
     println!("Waiting for the network to drain collateral + mint the private note…");
-    for i in 0..25 {
+    for i in 0..40 {
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-        client.sync_state().await?;
-        if let Some(rec) = client.get_input_note(payback_id).await? {
+        // Tolerate transient testnet sync races ("block_to > chain tip" /
+        // "RPC error") — skip this tick and retry rather than aborting the
+        // whole deposit on a hiccup (mirrors the redeem builder).
+        if let Err(e) = client.sync_state().await {
+            println!("    (sync retry: {})", e.to_string().lines().next().unwrap_or(""));
+            continue;
+        }
+        let maybe = match client.get_input_note(payback_id).await {
+            Ok(m) => m,
+            Err(e) => {
+                println!("    (get_note retry: {})", e.to_string().lines().next().unwrap_or(""));
+                continue;
+            }
+        };
+        if let Some(rec) = maybe {
             if rec.is_committed() {
                 println!("    minted after ~{}s — consuming…", (i + 1) * 6);
                 let creq = TransactionRequestBuilder::new()
@@ -259,6 +272,6 @@ async fn main() -> Result<()> {
             }
         }
     }
-    println!("    not minted after 150s — check network-note-status {note_id}");
+    println!("    not minted after ~240s — check network-note-status {note_id}");
     Ok(())
 }
