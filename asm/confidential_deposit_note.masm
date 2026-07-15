@@ -2,25 +2,26 @@
 # basket faucet-network account.
 #
 # One network transaction does the full confidential deposit:
-#   1. Read + REQUIRE exactly one collateral asset; its REAL amount is
-#      the mint basis. SECURITY: the mint is bound to the collateral the
-#      note actually carries, NOT to an emitter-controlled storage felt.
-#      To mint X basket tokens the note must be funded with X*nav_scale
-#      worth of dUSDC, which the emitter must own to emit the note — so a
-#      note with zero/underfunded collateral can no longer mint from thin
-#      air. (Was: mint_amount = storage[106]; storage is set by the
-#      emitter and independent of the drained NoteAssets.)
+#   1. Read + REQUIRE exactly one collateral asset AND that its faucet is
+#      dUSDC. Its REAL drained amount is the mint basis. SECURITY: mint is
+#      bound to the collateral the note actually carries — NOT to any
+#      emitter-controlled storage felt, and NOT scaled by any emitter felt
+#      (see step 3). To mint X basket tokens the note must be funded with
+#      X dUSDC, which the emitter must own to emit the note.
 #   2. Drain that collateral into the faucet's vault (public AUM).
-#   3. mint_amount = collateral_amount * fee_factor / nav_scale.
+#   3. mint_amount = collateral_amount  (fixed 1:1; 1 basket token == 1
+#      dUSDC). The mint ratio is deliberately NOT read from storage: the
+#      old fee_factor/nav_scale felts were emitter input and let a note
+#      mint collateral*1e6 tokens, then redeem them 1:1 to drain the pool.
+#      Real NAV pricing needs a trusted on-chain oracle + pro-rata redeem.
 #   4. mint_and_send → a PRIVATE P2ID note to the depositor's wallet.
 #
 # Storage felts (loaded at ptr 100):
 #   100..103 = RECIPIENT digest  (P2ID private → depositor wallet)
 #   104      = note_type         (Private = 0)
 #   105      = tag               (with_account_target(depositor))
-#   106      = deposit_value     (ADVISORY only — no longer trusted for the mint)
-#   107      = fee_factor
-#   108      = nav_scale
+#   106..108 = legacy deposit_value/fee_factor/nav_scale — IGNORED by the
+#              executed code (kept only for storage-layout stability).
 #
 # NOTE: changing this script changes its root; the basket faucet's
 # AuthNetworkAccount allowlist must be redeployed with the new root.

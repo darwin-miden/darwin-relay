@@ -150,8 +150,14 @@ async fn main() -> Result<()> {
     let note = Note::with_attachments(assets, metadata, note_recipient, attachments);
     let note_id = note.id();
 
-    // Tokens the network will mint: deposit_value * fee_factor / nav_scale.
-    let mint_amount = amount.saturating_mul(fee_factor) / nav_scale.max(1);
+    // Tokens the network will mint. MUST match the on-chain note, which
+    // mints exactly the drained collateral 1:1 (it ignores fee_factor/
+    // nav_scale — those are legacy no-ops). Using anything else here would
+    // reconstruct a payback note the network never created, so the consume
+    // below would fail. The --fee-factor/--nav-scale flags are retained
+    // only for back-compat and have no effect on minted value.
+    let _ = (fee_factor, nav_scale);
+    let mint_amount = amount;
 
     if emit_json {
         use base64::Engine as _;
