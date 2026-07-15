@@ -31,17 +31,28 @@ use miden::protocol::active_account
 use miden::protocol::asset
 use miden::protocol::asset::ASSET_VALUE_MEMORY_OFFSET
 use miden::protocol::asset::ASSET_SIZE
-use darwin::math
 use miden::standards::wallets::basic
 use miden::standards::faucets::fungible
 
 # Read the note's single collateral asset amount (the REAL mint basis)
 # and stash it at abs mem[210]. Asserts exactly one asset so a
-# multi-asset note can't smuggle in a second, unpriced asset.
+# multi-asset note can't smuggle in a second, unpriced asset, AND that the
+# asset's faucet is dUSDC (SECURITY / Attack-B: without this, a note could
+# deposit a worthless token, mint basket tokens against it, then redeem a
+# pro-rata share of the REAL dUSDC other users deposited).
 @locals(64)
 proc read_collateral_amount
     locaddr.0 exec.active_note::get_assets      # [num_assets]
     push.1 assert_eq.err="confidential deposit note must carry exactly one collateral asset"
+
+    # collateral faucet must be dUSDC (felts baked in ⇒ part of the note
+    # root, so an attacker can't swap in a worthless-token faucet without
+    # producing a different, non-allowlisted script).
+    padw locaddr.0 mem_loadw_le                  # [ASSET_KEY]
+    exec.asset::key_into_faucet_id               # [faucet_suffix, faucet_prefix]
+    push.7513476840783009536 assert_eq.err="confidential deposit collateral must be dUSDC"
+    push.18199311028627498257 assert_eq.err="confidential deposit collateral must be dUSDC"
+
     padw locaddr.0 add.ASSET_VALUE_MEMORY_OFFSET mem_loadw_le  # [ASSET_VALUE]
     exec.asset::fungible_value_into_amount       # [collateral_amount]
     mem_store.210
@@ -76,13 +87,16 @@ begin
     # 2. drain the dUSDC collateral into the faucet vault
     exec.drain_collateral_into_faucet
 
-    # 3. mint_amount = collateral_amount * fee_factor / nav_scale
-    mem_load.210                       # collateral_amount (drained, trusted)
-    push.107 mem_load                  # fee_factor
-    mul
-    push.108 mem_load                  # nav_scale
-    swap
-    exec.math::felt_div                # [mint_amount]
+    # 3. mint_amount = collateral_amount  (1 basket token == 1 dUSDC).
+    #    SECURITY: the mint ratio is NOT taken from the emitter-controlled
+    #    storage felts fee_factor(107)/nav_scale(108). Those are attacker
+    #    input; using them let a note mint e.g. collateral*1e6 tokens and
+    #    then redeem them 1:1 to drain other depositors' dUSDC from the
+    #    pooled vault. Fixing the ratio at 1:1 makes deposit and the 1:1
+    #    redeem conserve exactly and removes every emitter lever on value.
+    #    (Real NAV pricing must come from a TRUSTED on-chain oracle plus a
+    #    pro-rata redeem — future work — never from note storage felts.)
+    mem_load.210                       # [mint_amount = collateral_amount]
 
     # 4. build the basket-token asset for the active faucet
     exec.active_account::get_id        # [suffix, prefix, mint_amount]

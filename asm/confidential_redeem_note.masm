@@ -52,6 +52,15 @@ begin
     push.100 exec.active_note::get_storage
     drop drop
 
+    # 0. defense in depth: the release asset (storage KEY[108]) MUST be
+    #    dUSDC. The vault only holds dUSDC today (deposits are dUSDC-gated),
+    #    but assert it so a redeemer can never target a different vault
+    #    asset if one ever lands there. Felts baked in ⇒ part of the root.
+    padw push.108 mem_loadw_le         # [dUSDC_KEY]
+    exec.asset::key_into_faucet_id     # [faucet_suffix, faucet_prefix]
+    push.7513476840783009536 assert_eq.err="redeem release asset must be dUSDC"
+    push.18199311028627498257 assert_eq.err="redeem release asset must be dUSDC"
+
     # 1. read the REAL burned amount (before receive_and_burn clobbers mem)
     exec.read_burned_amount
 
