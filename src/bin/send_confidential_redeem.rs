@@ -88,6 +88,7 @@ async fn main() -> Result<()> {
     let mut collateral_faucet = DEFAULT_DUSDC.to_string();
     let mut amount: u64 = 100_000;
     let mut print_root = false;
+    let mut emit_json = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -97,6 +98,7 @@ async fn main() -> Result<()> {
             "--collateral" => collateral_faucet = args.next().context("--collateral value")?,
             "--amount" => amount = args.next().context("--amount value")?.parse()?,
             "--print-root" => print_root = true,
+            "--emit-json" => emit_json = true,
             _ => {}
         }
     }
@@ -139,6 +141,37 @@ async fn main() -> Result<()> {
         NoteRecipient::new(rand_word()?, note_script, NoteStorage::new(storage_felts)?);
     let note = Note::with_attachments(assets, metadata, note_recipient, attachments);
     let note_id = note.id();
+
+    if emit_json {
+        use base64::Engine as _;
+        use miden_protocol::utils::serde::Serializable;
+        let note_b64 = base64::engine::general_purpose::STANDARD.encode(note.to_bytes());
+        // Private payback: the released dUSDC the browser imports + consumes.
+        let release_payback = FungibleAsset::new(collateral_faucet, amount)?;
+        let payback_note = Note::new(
+            NoteAssets::new(vec![Asset::Fungible(release_payback)])?,
+            PartialNoteMetadata::new(faucet, NoteType::Private).with_tag(payback_tag),
+            P2idNoteStorage::new(recipient).into_recipient(payback_serial),
+        );
+        let payback_file = miden_protocol::note::NoteFile::NoteDetails {
+            details: payback_note.clone().into(),
+            after_block_num: 0u32.into(),
+            tag: Some(payback_tag),
+        };
+        let payback_b64 =
+            base64::engine::general_purpose::STANDARD.encode(payback_file.to_bytes());
+        println!(
+            "{}",
+            serde_json::json!({
+                "noteId": note_id.to_string(),
+                "noteB64": note_b64,
+                "paybackId": payback_note.id().to_string(),
+                "paybackFileB64": payback_b64,
+                "releaseAmount": amount.to_string(),
+            })
+        );
+        return Ok(());
+    }
 
     let home = std::env::var("HOME")?;
     let store_path = std::env::var("DARWIN_RELAY_V2_MIDEN_STORE").unwrap_or_else(|_| {
