@@ -119,6 +119,21 @@ async fn main() -> Result<()> {
     let recipient = AccountId::from_hex(&recipient.unwrap_or_else(|| DEFAULT_SENDER.to_string()))?;
     let collateral_faucet = AccountId::from_hex(&collateral_faucet)?;
 
+    // Defense in depth (the on-chain note asserts both of these too, but
+    // fail fast so we never build a doomed note or panic the builder):
+    //  - collateral must be dUSDC (else the note reverts on-chain),
+    //  - amount must fit a fungible asset (a near-u64::MAX value would
+    //    otherwise panic Felt::new below before FungibleAsset::new could
+    //    reject it — 2^63-1 is the max fungible amount and is in-field).
+    anyhow::ensure!(
+        collateral_faucet == AccountId::from_hex(DEFAULT_DUSDC)?,
+        "collateral faucet must be dUSDC ({DEFAULT_DUSDC})"
+    );
+    anyhow::ensure!(
+        amount <= (1u64 << 63) - 1,
+        "amount {amount} exceeds the max fungible-asset amount (2^63-1)"
+    );
+
     // Precompute the private payback P2ID (the minted basket-token note).
     let payback_serial = rand_word()?;
     let payback_recipient = P2idNoteStorage::new(recipient).into_recipient(payback_serial);
