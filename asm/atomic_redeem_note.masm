@@ -1,6 +1,6 @@
 # Atomic RedeemNote — Flow C Path 2 in one note, kernel-aware.
 #
-# Spec: darwin-docs/m1-architecture-spec.md §6.5 + §7.2.
+# Spec: darwin-docs/architecture-spec.md §6.5 + §7.2.
 #
 # Consumed by a Darwin Protocol Account that exposes `receive_asset`
 # (mirror of `miden::standards::wallets::basic::receive_asset`). The

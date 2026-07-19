@@ -1,6 +1,6 @@
 # Felt-scale math helpers used by the Darwin Protocol Account.
 #
-# Spec: darwin-docs/m1-architecture-spec.md §6.2 (NAV precision).
+# Spec: darwin-docs/architecture-spec.md §6.2 (NAV precision).
 #
 # The other library modules (mint, fees, redeem, nav, flow) use
 # `u32div` for their final integer division. That op requires both
