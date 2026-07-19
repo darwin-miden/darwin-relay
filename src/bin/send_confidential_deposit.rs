@@ -193,6 +193,10 @@ async fn main() -> Result<()> {
         };
         let payback_b64 =
             base64::engine::general_purpose::STANDARD.encode(payback_file.to_bytes());
+        // Raw Note bytes too, so the browser can pass them to requestConsume's
+        // noteBytes and import+consume in ONE wallet prompt instead of two.
+        let payback_note_b64 =
+            base64::engine::general_purpose::STANDARD.encode(payback_note.to_bytes());
         println!(
             "{}",
             serde_json::json!({
@@ -200,6 +204,7 @@ async fn main() -> Result<()> {
                 "noteB64": note_b64,
                 "paybackId": payback_note.id().to_string(),
                 "paybackFileB64": payback_b64,
+                "paybackNoteB64": payback_note_b64,
                 "mintAmount": mint_amount.to_string(),
             })
         );
